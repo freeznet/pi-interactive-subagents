@@ -16,7 +16,7 @@
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
@@ -26,6 +26,7 @@ import {
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
+  untrackSurface,
   startPi,
   waitForScreen,
   waitForFile,
@@ -33,7 +34,13 @@ import {
   uniqueId,
   trackTempFile,
   readScreen,
+  sendCommand,
+  closeSurface,
+  waitForHerdrPaneForSession,
+  waitForHerdrPaneClosed,
+  TEST_MODEL,
   PI_TIMEOUT,
+  SHELL_READY_DELAY_MS,
   type TestEnv,
 } from "./harness.ts";
 
@@ -41,11 +48,11 @@ const backends = getAvailableBackends();
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside Herdr, cmux, tmux, zellij, or WezTerm to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
+  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 12 }, () => {
     let prevMux: string | undefined;
     let env: TestEnv;
 
@@ -59,6 +66,15 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
+    afterEach(() => {
+      for (const surface of [...env.surfaces]) {
+        try {
+          closeSurface(surface);
+        } catch {}
+        untrackSurface(env, surface);
+      }
+    });
+
     // ── Basic spawn + completion ──
 
     it("spawns a subagent that writes a file and verifies the session", async () => {
@@ -67,7 +83,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `echo-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -90,7 +106,7 @@ for (const backend of backends) {
       // Verify: outer pi received the subagent result
       const screen = await waitForScreen(
         surface,
-        /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
+        /INTEGRATION_COMPLETE/,
         PI_TIMEOUT,
       );
 
@@ -119,7 +135,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `status-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -147,11 +163,11 @@ for (const backend of backends) {
 
       const completionScreen = await waitForScreen(
         surface,
-        /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
+        /STATUS_TEST_DONE/,
         PI_TIMEOUT,
         300,
       );
-      assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
+      assert.match(completionScreen, /STATUS_TEST_DONE/);
     });
 
     // ── Parallel subagent spawn ──
@@ -164,7 +180,7 @@ for (const backend of backends) {
       trackTempFile(env, fileB);
 
       const surface = createTrackedSurface(env, `parallel-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `You must call the subagent tool TWICE. Make both calls before waiting for results.`,
@@ -180,6 +196,7 @@ for (const backend of backends) {
         `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
         ``,
         `Call both subagent tools NOW, do not wait between them.`,
+        `After both subagent results arrive, say PARALLEL_DONE_${id}.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
@@ -192,6 +209,7 @@ for (const backend of backends) {
 
       assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
       assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
+      await waitForScreen(surface, new RegExp(`PARALLEL_DONE_${id}`), PI_TIMEOUT, 300);
     });
 
     // ── Fork mode ──
@@ -202,14 +220,16 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `fork-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
         `  fork: true`,
+        `  cwd: "${env.dir}"`,
+        `  model: "${TEST_MODEL}"`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `Do not set the agent parameter. Set only name, fork, cwd, model, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
@@ -222,7 +242,7 @@ for (const backend of backends) {
       // Wait for the outer pi to show the result
       const screen = await waitForScreen(
         surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
+        /FORK_COMPLETE/,
         PI_TIMEOUT,
       );
 
@@ -250,7 +270,7 @@ for (const backend of backends) {
       const id = uniqueId();
 
       const surface = createTrackedSurface(env, `ping-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -284,7 +304,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `discovery-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       // Use subagents_list to verify test agents are discoverable,
       // then spawn one to prove it works end-to-end.
@@ -302,6 +322,7 @@ for (const backend of backends) {
       // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
+      await waitForScreen(surface, /DISCOVERY_DONE/, PI_TIMEOUT, 300);
     });
 
     // ── Subagent with custom system prompt ──
@@ -312,7 +333,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `sysprompt-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these parameters:`,
@@ -327,6 +348,125 @@ for (const backend of backends) {
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
       assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+      await waitForScreen(
+        surface,
+        /SYSPROMPT_TEST_DONE/,
+        PI_TIMEOUT,
+        300,
+      );
     });
+
+    if (backend === "herdr") {
+      it("resumes the same session and appends a follow-up result", async () => {
+        const id = uniqueId();
+        const seedFile = `/tmp/pi-integ-resume-seed-${id}.txt`;
+        const resumedFile = `/tmp/pi-integ-resume-done-${id}.txt`;
+        const sessionPathFile = `/tmp/pi-integ-resume-session-${id}.txt`;
+        for (const file of [seedFile, resumedFile, sessionPathFile]) trackTempFile(env, file);
+
+        const surface = createTrackedSurface(env, `resume-${id}`);
+        await sleep(SHELL_READY_DELAY_MS);
+
+        const task = [
+          `Call the subagent tool with these EXACT parameters:`,
+          `  name: "ResumeSeed-${id}"`,
+          `  agent: "test-echo"`,
+          `  task: "Run this exact bash command: printf '%s' \"$PI_SUBAGENT_SESSION\" > '${sessionPathFile}'; echo 'SEED_${id}' > '${seedFile}'"`,
+          `Wait for that subagent result.`,
+          `Read ${sessionPathFile} to obtain the exact .jsonl session path.`,
+          `Then call subagent_resume with these EXACT parameters:`,
+          `  sessionPath: the exact path read from ${sessionPathFile}`,
+          `  name: "ResumeFollow-${id}"`,
+          `  message: "Run this bash command now: echo 'RESUMED_${id}' > '${resumedFile}'"`,
+          `  autoExit: true`,
+          `Do not spawn another subagent. After the resumed result arrives, say RESUME_TEST_DONE.`,
+        ].join("\n");
+
+        startPi(surface, env.dir, task);
+
+        const sessionPath = (await waitForFile(sessionPathFile, PI_TIMEOUT, /\.jsonl/)).trim();
+        assert.ok(existsSync(sessionPath), `Seed session should exist: ${sessionPath}`);
+        const seedPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+        await waitForFile(seedFile, PI_TIMEOUT, new RegExp(`SEED_${id}`));
+        await waitForHerdrPaneClosed(seedPane, PI_TIMEOUT);
+
+        const resumedPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+        assert.notEqual(resumedPane, seedPane, "Resume must launch in a new stable pane");
+
+        const resumed = await waitForFile(resumedFile, PI_TIMEOUT, new RegExp(`RESUMED_${id}`));
+        assert.ok(resumed.includes(`RESUMED_${id}`));
+        await waitForHerdrPaneClosed(resumedPane, PI_TIMEOUT);
+        await waitForScreen(
+          surface,
+          /RESUME_TEST_DONE/,
+          PI_TIMEOUT,
+          300,
+        );
+
+        const entries = readFileSync(sessionPath, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const userMessages = entries.filter(
+          (entry) => entry.type === "message" && entry.message?.role === "user",
+        );
+        const assistantMessages = entries.filter(
+          (entry) => entry.type === "message" && entry.message?.role === "assistant",
+        );
+        assert.ok(userMessages.length >= 2, "Resume must append another user turn to same session");
+        assert.ok(
+          assistantMessages.length >= 2,
+          "Resume must append another assistant turn to same session",
+        );
+      });
+
+      it("interrupts a running child by name and watcher later closes its pane", async () => {
+        const id = uniqueId();
+        const startFile = `/tmp/pi-integ-interrupt-start-${id}.txt`;
+        const lateFile = `/tmp/pi-integ-interrupt-late-${id}.txt`;
+        const sessionPathFile = `/tmp/pi-integ-interrupt-session-${id}.txt`;
+        for (const file of [startFile, lateFile, sessionPathFile]) trackTempFile(env, file);
+
+        const surface = createTrackedSurface(env, `interrupt-${id}`);
+        await sleep(SHELL_READY_DELAY_MS);
+
+        const childName = `Interrupt-${id}`;
+        const task = [
+          `Call the subagent tool with these EXACT parameters:`,
+          `  name: "${childName}"`,
+          `  agent: "test-echo"`,
+          `  task: "Run this exact bash command: printf '%s' \"$PI_SUBAGENT_SESSION\" > '${sessionPathFile}'; echo 'START_${id}' > '${startFile}'; sleep 120; echo 'TOO_LATE_${id}' > '${lateFile}'"`,
+          `Immediately after the subagent tool returns, call test_wait_for_file with path "${startFile}".`,
+          `Then call subagent_interrupt with exactly this JSON object: {"name":"${childName}"}.`,
+          `Do not set the id parameter. You must target by the full display name.`,
+          `After the interrupt acknowledgement, say INTERRUPT_ACK_${id}.`,
+          `Do not call subagent_resume and do not spawn another subagent.`,
+        ].join("\n");
+
+        startPi(surface, env.dir, task);
+
+        await waitForFile(startFile, PI_TIMEOUT, new RegExp(`START_${id}`));
+        const sessionPath = (await waitForFile(sessionPathFile, PI_TIMEOUT, /\.jsonl/)).trim();
+        assert.ok(existsSync(sessionPath), `Interrupted child session should exist: ${sessionPath}`);
+        const childPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+
+        const interruptScreen = await waitForScreen(
+          surface,
+          /interrupt requested|No running subagent|Failed to send Escape/i,
+          PI_TIMEOUT,
+          300,
+        );
+        assert.match(interruptScreen, /interrupt requested/i);
+
+        await sleep(1500);
+        sendCommand(
+          childPane,
+          `Reply exactly INTERRUPT_CLEANUP_DONE_${id}. Do not call tools.`,
+        );
+
+        await waitForHerdrPaneClosed(childPane, PI_TIMEOUT);
+        assert.equal(existsSync(lateFile), false, "Interrupted tool must not finish its delayed command");
+      });
+    }
   });
 }

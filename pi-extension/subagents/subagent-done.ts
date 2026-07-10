@@ -42,6 +42,16 @@ export interface SubagentErrorInfo {
   stopReason: "error";
 }
 
+export function buildAgentEndExitData(errorInfo: SubagentErrorInfo | null) {
+  return errorInfo
+    ? {
+        type: "error" as const,
+        errorMessage: errorInfo.errorMessage,
+        stopReason: errorInfo.stopReason,
+      }
+    : { type: "done" as const };
+}
+
 /**
  * If the last assistant message in the turn ended with `stopReason: "error"`
  * (typically auto-retry exhausted on an overload / rate limit / server error),
@@ -176,26 +186,17 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
+      // Always write the sidecar before shutdown. Narrow panes can wrap the
+      // shell sentinel, so normal auto-exit completion must not depend on
+      // screen parsing. Error turns carry their provider failure details.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify(buildAgentEndExitData(errorInfo)));
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort — the watcher still has its screen sentinel fallback,
+          // and session parsing can recover provider error details.
         }
       }
 

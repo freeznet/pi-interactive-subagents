@@ -57,13 +57,13 @@ Format as markdown. Omit empty sections. Strip the `type(scope):` prefix from ea
 Install:
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents@v<VERSION>
+pi install git:github.com/freeznet/pi-interactive-subagents@v<VERSION>
 ```
 
 Or latest:
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/freeznet/pi-interactive-subagents
 ```
 ````
 

@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect available mux backends (Herdr, cmux, tmux, zellij, WezTerm)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -12,16 +12,19 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
+  copyFileSync,
+  symlinkSync,
   readdirSync,
   rmSync,
   existsSync,
   readFileSync,
+  realpathSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   getMuxBackend,
   createSurface,
@@ -35,8 +38,10 @@ import {
   shellEscape,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxPaneRefForSurfaceFromJson,
+  parseMuxPreference,
   type MuxBackend,
 } from "../../pi-extension/subagents/cmux.ts";
+import { herdrErrorCode } from "../../pi-extension/subagents/herdr.ts";
 
 // Re-export mux primitives for tests
 export {
@@ -70,6 +75,7 @@ const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
  * installed on the host.
  */
 const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
+const TEST_CONTROL_SOURCE = join(HARNESS_DIR, "test-control.ts");
 
 // ── Configuration ──
 
@@ -79,6 +85,137 @@ export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
+/** Shell startup delay for newly created integration surfaces. */
+export const SHELL_READY_DELAY_MS = Number(
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500",
+);
+
+const HERDR_CLI_OPTIONS = {
+  encoding: "utf8" as const,
+  timeout: 5_000,
+  maxBuffer: 4 * 1024 * 1024,
+  stdio: ["ignore", "pipe", "pipe"] as const,
+};
+
+export interface HerdrPaneInfo {
+  pane_id: string;
+  workspace_id: string;
+  tab_id: string;
+  focused?: boolean;
+  label?: string;
+  agent_session?: { value?: string };
+}
+
+export interface HerdrSnapshot {
+  focused_pane_id?: string;
+  focused_tab_id?: string;
+  focused_workspace_id?: string;
+  agents?: HerdrPaneInfo[];
+  panes?: HerdrPaneInfo[];
+  layouts?: Array<{
+    workspace_id: string;
+    tab_id: string;
+    focused_pane_id?: string;
+    panes?: Array<{ pane_id: string; focused?: boolean }>;
+  }>;
+}
+
+export function parseHerdrSnapshot(output: string): HerdrSnapshot {
+  const parsed = JSON.parse(output) as { result?: { snapshot?: unknown } };
+  const snapshot = parsed?.result?.snapshot;
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new Error("Unexpected Herdr api snapshot output: missing result.snapshot");
+  }
+  return snapshot as HerdrSnapshot;
+}
+
+export function parseHerdrPaneInfo(output: string): HerdrPaneInfo {
+  const parsed = JSON.parse(output) as { result?: { pane?: unknown } };
+  const pane = parsed?.result?.pane as HerdrPaneInfo | undefined;
+  if (!pane?.pane_id || !pane.workspace_id || !pane.tab_id) {
+    throw new Error("Unexpected Herdr pane get output: missing pane identity");
+  }
+  return pane;
+}
+
+export function getHerdrSnapshot(): HerdrSnapshot {
+  return parseHerdrSnapshot(execFileSync("herdr", ["api", "snapshot"], HERDR_CLI_OPTIONS));
+}
+
+export function getHerdrPaneInfo(paneId: string): HerdrPaneInfo | null {
+  try {
+    return parseHerdrPaneInfo(
+      execFileSync("herdr", ["pane", "get", paneId], HERDR_CLI_OPTIONS),
+    );
+  } catch (error) {
+    if (herdrErrorCode(error) === "pane_not_found") return null;
+    throw error;
+  }
+}
+
+export function getHerdrPaneForSession(sessionPath: string): string | null {
+  const snapshot = getHerdrSnapshot();
+  const canonicalSessionPath = canonicalPath(sessionPath);
+  return [...(snapshot.agents ?? []), ...(snapshot.panes ?? [])].find(
+    (pane) => {
+      const value = pane.agent_session?.value;
+      return value === sessionPath || (value != null && canonicalPath(value) === canonicalSessionPath);
+    },
+  )?.pane_id ?? null;
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+export function getHerdrPaneByLabel(label: string): string | null {
+  const snapshot = getHerdrSnapshot();
+  return snapshot.panes?.find((pane) => pane.label === label)?.pane_id ?? null;
+}
+
+export function createHerdrTab(input: {
+  workspaceId: string;
+  cwd: string;
+  label: string;
+}): { tabId: string; rootPaneId: string } {
+  const output = execFileSync(
+    "herdr",
+    [
+      "tab",
+      "create",
+      "--workspace",
+      input.workspaceId,
+      "--cwd",
+      input.cwd,
+      "--label",
+      input.label,
+      "--no-focus",
+    ],
+    HERDR_CLI_OPTIONS,
+  );
+  const parsed = JSON.parse(output) as {
+    result?: { tab?: { tab_id?: unknown }; root_pane?: { pane_id?: unknown } };
+  };
+  const tabId = parsed?.result?.tab?.tab_id;
+  const rootPaneId = parsed?.result?.root_pane?.pane_id;
+  if (typeof tabId !== "string" || typeof rootPaneId !== "string") {
+    throw new Error("Unexpected Herdr tab create output: missing tab/root pane identity");
+  }
+  return { tabId, rootPaneId };
+}
+
+export function focusHerdrTab(tabId: string): void {
+  execFileSync("herdr", ["tab", "focus", tabId], HERDR_CLI_OPTIONS);
+}
+
+export function closeHerdrTab(tabId: string): void {
+  execFileSync("herdr", ["tab", "close", tabId], HERDR_CLI_OPTIONS);
+}
+
 // ── Backend detection ──
 
 /**
@@ -86,10 +223,21 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
  * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
  */
 export function getAvailableBackends(): MuxBackend[] {
-  const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
+  const forced = parseMuxPreference(orig);
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  if (forced) {
+    if (getMuxBackend() !== forced) {
+      throw new Error(
+        `PI_SUBAGENT_MUX=${forced} requested, but ${forced} runtime prerequisites are unavailable`,
+      );
+    }
+    return [forced];
+  }
+
+  const backends: MuxBackend[] = [];
+
+  for (const backend of ["herdr", "tmux", "zellij", "cmux", "wezterm"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -129,7 +277,15 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
+export function supportsAbsoluteSurfaceFocus(backend: MuxBackend): boolean {
+  return backend === "cmux" || backend === "tmux";
+}
+
 export function getFocusedSurface(backend: MuxBackend): string | null {
+  if (backend === "herdr") {
+    return getHerdrSnapshot().focused_pane_id ?? null;
+  }
+
   if (backend === "cmux") {
     const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
     return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
@@ -157,6 +313,7 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   }
 
   if (backend === "tmux") return surface;
+  if (backend === "herdr") return surface;
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
 }
@@ -198,13 +355,32 @@ export interface TestEnv {
 export function createTestEnv(backend: MuxBackend): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
+  const isolatedAgentDir = join(dir, ".pi", "agent");
   mkdirSync(agentsDir, { recursive: true });
+  mkdirSync(isolatedAgentDir, { recursive: true });
+
+  // Child agents run with isolated settings/context so host-global extensions
+  // and AGENTS.md cannot change tool names or behavior. Reuse only credentials,
+  // model catalog, and the durable host session store.
+  const hostAgentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  for (const file of ["auth.json", "models.json"]) {
+    const source = join(hostAgentDir, file);
+    if (existsSync(source)) copyFileSync(source, join(isolatedAgentDir, file));
+  }
+  writeFileSync(join(isolatedAgentDir, "settings.json"), "{}\n", "utf8");
+  const hostSessionsDir = join(hostAgentDir, "sessions");
+  if (existsSync(hostSessionsDir)) {
+    symlinkSync(hostSessionsDir, join(isolatedAgentDir, "sessions"), "dir");
+  }
 
   // Copy test agent definitions into the project-local agents dir
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const content = readFileSync(join(TEST_AGENTS_SRC, file), "utf8")
+          .replace(/^---\n/, `---\ncwd: ${dir}\n`)
+          .replace(/^model:\s*.+$/m, `model: ${TEST_MODEL}`);
+        writeFileSync(join(agentsDir, file), content, "utf8");
       }
     }
   }
@@ -285,6 +461,7 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
+    `-e ${shellEscape(TEST_CONTROL_SOURCE)}`,
     `--model ${shellEscape(model)}`,
     extra,
     shellEscape(task),
@@ -325,6 +502,44 @@ export async function waitForScreen(
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
   );
+}
+
+export async function waitForHerdrPaneForSession(
+  sessionPath: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const paneId = getHerdrPaneForSession(sessionPath);
+    if (paneId) return paneId;
+    await sleep(500);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for Herdr pane for session ${sessionPath}`);
+}
+
+export async function waitForHerdrPaneByLabel(
+  label: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const paneId = getHerdrPaneByLabel(label);
+    if (paneId) return paneId;
+    await sleep(500);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for Herdr pane labeled ${label}`);
+}
+
+export async function waitForHerdrPaneClosed(
+  paneId: string,
+  timeout: number = PI_TIMEOUT,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (getHerdrPaneInfo(paneId) === null) return;
+    await sleep(500);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for Herdr pane ${paneId} to close`);
 }
 
 /**

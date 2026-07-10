@@ -3,10 +3,27 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import {
+  closeHerdrSurface,
+  createHerdrSurface,
+  readHerdrScreen,
+  readHerdrScreenAsync,
+  renameHerdrPane,
+  sendHerdrCommand,
+  sendHerdrEscape,
+} from "./herdr.ts";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "herdr" | "cmux" | "tmux" | "zellij" | "wezterm";
+
+export const AUTO_MUX_PRIORITY: readonly MuxBackend[] = [
+  "herdr",
+  "tmux",
+  "zellij",
+  "cmux",
+  "wezterm",
+];
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -41,10 +58,79 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-function muxPreference(): MuxBackend | null {
-  const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+export function parseMuxPreference(value: string | undefined): MuxBackend | null {
+  const pref = (value ?? "").trim().toLowerCase();
+  if (
+    pref === "herdr" ||
+    pref === "cmux" ||
+    pref === "tmux" ||
+    pref === "zellij" ||
+    pref === "wezterm"
+  ) {
+    return pref;
+  }
   return null;
+}
+
+function muxPreference(): MuxBackend | null {
+  return parseMuxPreference(process.env.PI_SUBAGENT_MUX);
+}
+
+export function selectMuxBackend(
+  availability: Partial<Record<MuxBackend, boolean>>,
+  preference?: string | null,
+): MuxBackend | null {
+  const preferred = parseMuxPreference(preference ?? undefined);
+  if (preferred) return availability[preferred] ? preferred : null;
+
+  for (const backend of AUTO_MUX_PRIORITY) {
+    if (availability[backend]) return backend;
+  }
+  return null;
+}
+
+export function isCompatibleHerdrStatus(output: string): boolean {
+  return /^\s*status:\s*running\s*$/m.test(output) && /^\s*compatible:\s*yes\s*$/m.test(output);
+}
+
+export function isHerdrRuntimeAvailableWith(
+  env: NodeJS.ProcessEnv,
+  dependencies: {
+    hasCommand: (command: string) => boolean;
+    isSocket: (path: string) => boolean;
+    status: () => string;
+  },
+): boolean {
+  const socket = env.HERDR_SOCKET_PATH;
+  if (
+    env.HERDR_ENV !== "1" ||
+    !env.HERDR_PANE_ID?.trim() ||
+    !socket ||
+    !dependencies.hasCommand("herdr")
+  ) {
+    return false;
+  }
+
+  try {
+    return dependencies.isSocket(socket) && isCompatibleHerdrStatus(dependencies.status());
+  } catch {
+    return false;
+  }
+}
+
+function isHerdrRuntimeAvailable(): boolean {
+  const socket = process.env.HERDR_SOCKET_PATH;
+  return isHerdrRuntimeAvailableWith(process.env, {
+    hasCommand,
+    isSocket: (path) => statSync(path).isSocket(),
+    status: () =>
+      execFileSync("herdr", ["status"], {
+        encoding: "utf8",
+        timeout: 2_000,
+        maxBuffer: 256 * 1024,
+        env: { ...process.env, HERDR_SOCKET_PATH: socket },
+      }),
+  });
 }
 
 function isCmuxRuntimeAvailable(): boolean {
@@ -67,6 +153,10 @@ export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function isTmuxAvailable(): boolean {
   return isTmuxRuntimeAvailable();
 }
@@ -80,17 +170,16 @@ export function isWezTermAvailable(): boolean {
 }
 
 export function getMuxBackend(): MuxBackend | null {
-  const pref = muxPreference();
-  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
-  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
-  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
-
-  if (isCmuxRuntimeAvailable()) return "cmux";
-  if (isTmuxRuntimeAvailable()) return "tmux";
-  if (isZellijRuntimeAvailable()) return "zellij";
-  if (isWezTermRuntimeAvailable()) return "wezterm";
-  return null;
+  return selectMuxBackend(
+    {
+      herdr: isHerdrRuntimeAvailable(),
+      tmux: isTmuxRuntimeAvailable(),
+      zellij: isZellijRuntimeAvailable(),
+      cmux: isCmuxRuntimeAvailable(),
+      wezterm: isWezTermRuntimeAvailable(),
+    },
+    process.env.PI_SUBAGENT_MUX,
+  );
 }
 
 export function isMuxAvailable(): boolean {
@@ -99,6 +188,9 @@ export function isMuxAvailable(): boolean {
 
 export function muxSetupHint(): string {
   const pref = muxPreference();
+  if (pref === "herdr") {
+    return "Start pi inside a Herdr-managed pane.";
+  }
   if (pref === "cmux") {
     return "Start pi inside cmux (`cmux pi`).";
   }
@@ -111,7 +203,7 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  return "Start pi inside Herdr, cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -146,6 +238,19 @@ function tailLines(text: string, lines: number): string {
   const split = text.split("\n");
   if (split.length <= lines) return text;
   return split.slice(-lines).join("\n");
+}
+
+// Surface IDs stay backend-bound for their lifetime. This prevents a transient
+// runtime probe failure from dispatching an existing pane to another nested mux.
+const surfaceBackends = new Map<string, MuxBackend>();
+
+function bindSurface(surface: string, backend: MuxBackend): string {
+  surfaceBackends.set(surface, backend);
+  return surface;
+}
+
+function backendForSurface(surface: string): MuxBackend {
+  return surfaceBackends.get(surface) ?? requireMuxBackend();
 }
 
 function zellijPaneId(surface: string): string {
@@ -747,19 +852,20 @@ function createCmuxSplitSurface(
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For tmux/wezterm: falls back to split behavior.
+ * For Herdr/tmux/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`w9:p5` in Herdr, `surface:42` in cmux, `%12` in tmux,
+ * `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurface(name: string): string {
-  const backend = getMuxBackend();
+  const backend = requireMuxBackend();
 
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
     try {
       const tree = execSync(`cmux tree`, { encoding: "utf8" });
       if (tree.includes(cmuxSubagentPane)) {
-        return createSurfaceInPane(name, cmuxSubagentPane);
+        return bindSurface(createSurfaceInPane(name, cmuxSubagentPane), backend);
       }
     } catch {}
     // Pane is gone — fall through to create a new split
@@ -769,17 +875,31 @@ export function createSurface(name: string): string {
   if (backend === "cmux") {
     const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
     cmuxSubagentPane = created.paneRef ?? null;
-    return created.surface;
+    return bindSurface(created.surface, backend);
+  }
+
+  if (backend === "herdr") {
+    const parentPaneId = process.env.HERDR_PANE_ID;
+    if (!parentPaneId?.trim()) throw new Error("HERDR_PANE_ID not set");
+    return bindSurface(
+      createHerdrSurface({
+        name,
+        parentPaneId,
+        direction: "right",
+        cwd: process.cwd(),
+      }),
+      backend,
+    );
   }
 
   if (backend === "zellij") {
-    return createZellijSurface(name);
+    return bindSurface(createZellijSurface(name), backend);
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
   // See https://github.com/HazAT/pi-interactive-subagents/issues/12
   const fromSurface = backend === "tmux" ? process.env.TMUX_PANE : undefined;
-  return createSurfaceSplit(name, "right", fromSurface);
+  return bindSurface(createSurfaceSplitForBackend(backend, name, "right", fromSurface), backend);
 }
 
 /**
@@ -810,14 +930,27 @@ function createSurfaceInPane(name: string, pane: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`w9:p5` in Herdr, `surface:42` in cmux, `%12` in tmux,
+ * `pane:7` in zellij, `42` in wezterm).
  */
-export function createSurfaceSplit(
+function createSurfaceSplitForBackend(
+  backend: MuxBackend,
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  const backend = requireMuxBackend();
+  if (backend === "herdr") {
+    const parentPaneId = fromSurface ?? process.env.HERDR_PANE_ID;
+    if (!parentPaneId?.trim()) {
+      throw new Error("Herdr split requires an explicit parent pane");
+    }
+    return createHerdrSurface({
+      name,
+      parentPaneId,
+      direction,
+      cwd: process.cwd(),
+    });
+  }
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
@@ -904,11 +1037,32 @@ export function createSurfaceSplit(
   return surface;
 }
 
+export function createSurfaceSplit(
+  name: string,
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  const backend = fromSurface
+    ? surfaceBackends.get(fromSurface) ?? requireMuxBackend()
+    : requireMuxBackend();
+  return bindSurface(
+    createSurfaceSplitForBackend(backend, name, direction, fromSurface),
+    backend,
+  );
+}
+
 /**
  * Rename the current tab/window.
  */
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    const paneId = process.env.HERDR_PANE_ID;
+    if (!paneId?.trim()) throw new Error("HERDR_PANE_ID not set");
+    renameHerdrPane(paneId, title);
+    return;
+  }
 
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
@@ -957,6 +1111,11 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    // Herdr workspace labels are user-owned. Pane rename provides local context.
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -1009,7 +1168,12 @@ export function renameWorkspace(title: string): void {
  * Send a command string to a pane and execute it.
  */
 export function sendCommand(surface: string, command: string): void {
-  const backend = requireMuxBackend();
+  const backend = backendForSurface(surface);
+
+  if (backend === "herdr") {
+    sendHerdrCommand(surface, command);
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
@@ -1041,7 +1205,12 @@ export function sendCommand(surface: string, command: string): void {
  * Send one Escape keypress to an active pane.
  */
 export function sendEscape(surface: string): void {
-  const backend = requireMuxBackend();
+  const backend = backendForSurface(surface);
+
+  if (backend === "herdr") {
+    sendHerdrEscape(surface);
+    return;
+  }
 
   if (backend === "cmux") {
     execFileSync("cmux", ["send", "--surface", surface, "\u001b"], { encoding: "utf8" });
@@ -1105,7 +1274,11 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  const backend = requireMuxBackend();
+  const backend = backendForSurface(surface);
+
+  if (backend === "herdr") {
+    return readHerdrScreen(surface, lines);
+  }
 
   if (backend === "cmux") {
     return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
@@ -1148,7 +1321,11 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  const backend = requireMuxBackend();
+  const backend = backendForSurface(surface);
+
+  if (backend === "herdr") {
+    return readHerdrScreenAsync(surface, lines);
+  }
 
   if (backend === "cmux") {
     const { stdout } = await execFileAsync(
@@ -1191,17 +1368,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  const backend = requireMuxBackend();
+  const backend = backendForSurface(surface);
+
+  if (backend === "herdr") {
+    closeHerdrSurface(surface);
+    surfaceBackends.delete(surface);
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
       encoding: "utf8",
     });
+    surfaceBackends.delete(surface);
     return;
   }
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    surfaceBackends.delete(surface);
     return;
   }
 
@@ -1209,10 +1394,12 @@ export function closeSurface(surface: string): void {
     execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", surface], {
       encoding: "utf8",
     });
+    surfaceBackends.delete(surface);
     return;
   }
 
   zellijActionSync(["close-pane"], surface);
+  surfaceBackends.delete(surface);
 }
 
 export interface PollResult {

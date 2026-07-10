@@ -5,241 +5,169 @@ description: Run the integration test suite and verify all sessions end-to-end. 
 
 # Run Integration Tests
 
-Execute the integration test suite inside cmux, then introspect every spawned session to verify the full subagent lifecycle worked end-to-end.
+Run unit, real mux-surface, and real Pi lifecycle tests from the current checkout. Keep integration execution serial.
 
-## Step 1: Preflight Checks
-
-Verify the environment is ready:
+## Step 1: Repository and mux preflight
 
 ```bash
-echo "CMUX_SOCKET_PATH=$CMUX_SOCKET_PATH"
-echo "TMUX=$TMUX"
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
 node --version
+printf 'PI_SUBAGENT_MUX=%s\n' "${PI_SUBAGENT_MUX:-auto}"
+printf 'HERDR_ENV=%s HERDR_PANE_ID=%s HERDR_SOCKET_PATH=%s\n' \
+  "${HERDR_ENV:-}" "${HERDR_PANE_ID:-}" "${HERDR_SOCKET_PATH:-}"
+printf 'CMUX_SOCKET_PATH=%s TMUX=%s ZELLIJ=%s WEZTERM_UNIX_SOCKET=%s\n' \
+  "${CMUX_SOCKET_PATH:-}" "${TMUX:-}" "${ZELLIJ:-${ZELLIJ_SESSION_NAME:-}}" \
+  "${WEZTERM_UNIX_SOCKET:-}"
+
+BACKEND=$(
+  node -e 'import("./pi-extension/subagents/cmux.ts").then(m => process.stdout.write(String(m.getMuxBackend())))'
+)
+test "$BACKEND" != "null" || {
+  echo "No supported mux backend available" >&2
+  exit 1
+}
+echo "Testing backend: $BACKEND"
 ```
 
-- At least one of `CMUX_SOCKET_PATH` or `TMUX` must be set
-- Node 22+ required
+Node 22+ required.
 
-If neither mux is available, stop and tell the user to run inside cmux or tmux.
-
-## Step 2: Run Unit Tests
-
-Run the fast unit tests first — if these fail, skip integration tests:
+For Herdr, require client/server compatibility plus caller identity and a real socket:
 
 ```bash
-cd /Users/haza/Projects/pi-interactive-subagents && node --test test/test.ts
+if [ "$BACKEND" = herdr ]; then
+  command -v herdr
+  test "${HERDR_ENV:-}" = 1
+  test -n "${HERDR_PANE_ID:-}"
+  test -n "${HERDR_TAB_ID:-}"
+  test -n "${HERDR_WORKSPACE_ID:-}"
+  test -S "${HERDR_SOCKET_PATH:-}"
+  herdr status
+  HERDR_BASELINE=$(mktemp)
+  herdr api snapshot > "$HERDR_BASELINE"
+fi
 ```
 
-All 114 unit tests must pass. If any fail, stop and fix them before proceeding.
+Supported/tested Herdr contract: client/server 0.7.3, protocol 16. Stop if `herdr status` reports incompatibility.
 
-## Step 3: Run Integration Tests
-
-Use cmux to run the integration tests in a dedicated surface so the main session stays responsive.
+## Step 2: Unit tests
 
 ```bash
-SURFACE=$(cmux new-surface --type terminal | awk '{print $2}')
-sleep 0.5
-cmux send --surface $SURFACE 'cd /Users/haza/Projects/pi-interactive-subagents && node --test --test-concurrency=1 test/integration/mux-surface.test.ts test/integration/subagent-lifecycle.test.ts 2>&1; echo __TESTS_DONE_$?__\n'
+cd "$ROOT"
+npm test
 ```
 
-`--test-concurrency=1` is required: the focus-preservation test asserts global mux state and would race against parallel suites.
+Require zero failures. Test counts are informational, not a contract.
 
-Poll until the sentinel appears:
+## Step 3: Real integration suites
+
+Always force detected backend so unavailable-runtime mistakes fail fast instead of skipping successfully:
 
 ```bash
-cmux read-screen --surface $SURFACE --lines 200
+cd "$ROOT"
+export PI_SUBAGENT_MUX="$BACKEND"
+
+if [ "$BACKEND" = herdr ]; then
+  for run in 1 2; do
+    node --test --test-concurrency=1 test/integration/mux-surface.test.ts
+  done
+else
+  node --test --test-concurrency=1 test/integration/mux-surface.test.ts
+fi
+
+node --test --test-concurrency=1 test/integration/subagent-lifecycle.test.ts
+npm run test:integration
 ```
 
-Look for `__TESTS_DONE_0__` (success) or `__TESTS_DONE_1__` (failure). Poll every 15 seconds. Timeout after 10 minutes.
+`--test-concurrency=1` is mandatory: focus/placement tests manipulate global mux state. Output must contain suites named with forced backend, for example `mux-surface [herdr]` and `subagent-lifecycle [herdr]`. Any `No mux backend available` message is failure in forced mode.
 
-Once done, capture the full output and close the surface:
-
-```bash
-cmux read-screen --surface $SURFACE --scrollback --lines 500
-cmux close-surface --surface $SURFACE
-```
-
-### Expected results
-
-| Suite | Tests | Approx Duration |
-|-------|-------|-----------------|
-| `mux-surface` | 8 | ~45s |
-| `subagent-lifecycle` | 7 | ~170s |
-
-All 15 tests must pass. If any fail, report the failure output and stop.
-
-The long-running `keeps a long active tool call from surfacing false stalled status` test in `subagent-lifecycle` runs ~100s on its own — total wall time is ~3:30.
-
-### Configuration
-
-Override defaults with environment variables:
+Configure LLM-backed lifecycle tests when needed:
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `PI_TEST_MODEL` | `anthropic/claude-haiku-4-5` | Model for LLM-backed tests |
+|---|---|---|
+| `PI_TEST_MODEL` | `anthropic/claude-haiku-4-5` | Model for real Pi sessions |
 | `PI_TEST_TIMEOUT` | `120000` | Per-test timeout in ms |
 
-## Step 4: Introspect Sessions
+## Step 4: Herdr leak check
 
-After tests pass, verify the sessions created during the test run are well-formed. Find them by looking for session directories matching the temp dir pattern:
+When `BACKEND=herdr`, compare caller workspace/tab pane IDs before and after tests:
 
 ```bash
-# Find session dirs created in the last 15 minutes
-find ~/.pi/agent/sessions -type d -name '--private-var-*pi-integ*' -mmin -15 2>/dev/null
+HERDR_AFTER=$(mktemp)
+herdr api snapshot > "$HERDR_AFTER"
+
+node - "$HERDR_BASELINE" "$HERDR_AFTER" "$HERDR_WORKSPACE_ID" "$HERDR_TAB_ID" <<'NODE'
+const fs = require("node:fs");
+const [beforePath, afterPath, workspaceId, tabId] = process.argv.slice(2);
+const read = (path) => JSON.parse(fs.readFileSync(path, "utf8")).result.snapshot;
+const paneIds = (snapshot) => new Set(
+  (snapshot.layouts ?? [])
+    .filter((layout) => layout.workspace_id === workspaceId && layout.tab_id === tabId)
+    .flatMap((layout) => (layout.panes ?? []).map((pane) => pane.pane_id)),
+);
+const before = paneIds(read(beforePath));
+const after = paneIds(read(afterPath));
+const leaked = [...after].filter((pane) => !before.has(pane));
+if (leaked.length) {
+  console.error(`Leaked Herdr panes: ${leaked.join(", ")}`);
+  process.exit(1);
+}
+console.log(`Herdr pane baseline restored (${after.size} caller-tab panes)`);
+NODE
+
+rm -f "$HERDR_BASELINE" "$HERDR_AFTER"
 ```
 
-If no directory is found, widen the search:
+## Step 5: Session validation
+
+Locate newest integration session directory, then validate every JSONL file found. Do not require fixed parent/child counts; tests evolve.
 
 ```bash
-find ~/.pi/agent/sessions -type d -name '*pi-integ*' 2>/dev/null | tail -5
-```
+SESSION_DIR=$(
+  find ~/.pi/agent/sessions -type d -name '*pi-integ*' -mmin -30 2>/dev/null \
+    | tail -1
+)
+test -n "$SESSION_DIR" || {
+  echo "No recent pi-integ session directory found" >&2
+  exit 1
+}
 
-Once found, analyze every session file in that directory:
+python3 - "$SESSION_DIR" <<'PY'
+import glob, json, os, sys
 
-```bash
-SESSION_DIR="<the directory found above>"
-for f in "$SESSION_DIR"/*.jsonl; do
-  echo "=== $(basename $f) ==="
-  head -1 "$f" | python3 -c "
-import sys, json
-d = json.loads(sys.stdin.readline())
-print(f\"  type: {d.get('type')}  id: {d.get('id','?')[:12]}  parent: {'YES' if d.get('parentSession') else 'no'}\")
-"
-  python3 -c "
-import sys, json
-roles = {}
-for line in open('$f'):
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        t = d.get('type','?')
-        if t == 'message':
-            r = d.get('message',{}).get('role','?')
-            roles[r] = roles.get(r,0)+1
-        else:
-            roles[t] = roles.get(t,0)+1
-    except: pass
-print('  entries:', ' '.join(f'{k}:{v}' for k,v in sorted(roles.items())))
-"
-done
-```
+session_dir = sys.argv[1]
+files = sorted(glob.glob(os.path.join(session_dir, "*.jsonl")))
+if not files:
+    raise SystemExit(f"No session files in {session_dir}")
 
-### What to verify
-
-Check each session against these criteria:
-
-| Check | How | Pass condition |
-|-------|-----|----------------|
-| **Session header** | First line has `"type": "session"` | Every `.jsonl` file |
-| **Has messages** | At least 1 `user` + 1 `assistant` message | Every session |
-| **Tool usage** | At least 1 `toolResult` entry | Subagent sessions (they run bash/write) |
-| **Fork linkage** | `parentSession` field in header | Exactly 1 session (from fork test) |
-| **No errors** | No `"type": "error"` entries | All sessions |
-| **Clean exit** | No `stopReason: "aborted"` on final assistant message | All sessions |
-| **Parent count** | Multiple parent sessions (one per lifecycle test) | At least 5 parent sessions |
-| **Subagent count** | Multiple subagent sessions spawned | At least 7 subagent sessions (1 echo + 1 long-tool + 2 parallel + 1 fork + 1 ping + 1 discovery + 1 sysprompt) |
-
-Run a comprehensive validation:
-
-```bash
-python3 -c "
-import json, os, sys, glob
-
-session_dir = '$SESSION_DIR'
-files = sorted(glob.glob(os.path.join(session_dir, '*.jsonl')))
-print(f'Found {len(files)} session files\n')
-
-parents = []
-children = []
 errors = []
-
-for f in files:
-    name = os.path.basename(f)
-    lines = [json.loads(l) for l in open(f) if l.strip()]
-    if not lines:
-        errors.append(f'{name}: empty file')
+parents = children = 0
+for path in files:
+    name = os.path.basename(path)
+    entries = [json.loads(line) for line in open(path) if line.strip()]
+    if not entries or entries[0].get("type") != "session":
+        errors.append(f"{name}: missing session header")
         continue
-
-    header = lines[0]
-    if header.get('type') != 'session':
-        errors.append(f'{name}: first entry is {header.get(\"type\")}, not session')
-        continue
-
-    is_child = bool(header.get('parentSession'))
-    msgs = [l for l in lines if l.get('type') == 'message']
-    user_msgs = [m for m in msgs if m.get('message',{}).get('role') == 'user']
-    asst_msgs = [m for m in msgs if m.get('message',{}).get('role') == 'assistant']
-    tool_results = [m for m in msgs if m.get('message',{}).get('role') == 'toolResult']
-    error_entries = [l for l in lines if l.get('type') == 'error']
-
-    info = {
-        'name': name,
-        'entries': len(lines),
-        'users': len(user_msgs),
-        'assistants': len(asst_msgs),
-        'tools': len(tool_results),
-        'errors': len(error_entries),
-        'is_child': is_child,
-    }
-
-    if is_child:
-        children.append(info)
+    if entries[0].get("parentSession"):
+        children += 1
     else:
-        parents.append(info)
+        parents += 1
+    messages = [entry.get("message", {}) for entry in entries if entry.get("type") == "message"]
+    if not any(message.get("role") == "user" for message in messages):
+        errors.append(f"{name}: no user message")
+    if not any(message.get("role") == "assistant" for message in messages):
+        errors.append(f"{name}: no assistant message")
+    if any(entry.get("type") == "error" for entry in entries):
+        errors.append(f"{name}: error entry present")
 
-    # Validate
-    if not user_msgs:
-        errors.append(f'{name}: no user messages')
-    if not asst_msgs:
-        errors.append(f'{name}: no assistant messages')
-    if error_entries:
-        errors.append(f'{name}: has {len(error_entries)} error entries')
-
-    # Check for aborted final assistant
-    for m in reversed(msgs):
-        if m.get('message',{}).get('role') == 'assistant':
-            if m.get('message',{}).get('stopReason') == 'aborted':
-                errors.append(f'{name}: final assistant message was aborted')
-            break
-
-print(f'Parent sessions: {len(parents)}')
-for p in parents:
-    print(f'  {p[\"name\"][:40]}  entries:{p[\"entries\"]}  user:{p[\"users\"]}  asst:{p[\"assistants\"]}  tools:{p[\"tools\"]}')
-
-print(f'\nChild sessions (parentSession set): {len(children)}')
-for c in children:
-    print(f'  {c[\"name\"][:40]}  entries:{c[\"entries\"]}  user:{c[\"users\"]}  asst:{c[\"assistants\"]}  tools:{c[\"tools\"]}')
-
-fork_count = sum(1 for c in children if c['is_child'])
-print(f'\nFork sessions: {fork_count}')
-
+print(f"Validated {len(files)} sessions: {parents} parent, {children} fork-linked child")
 if errors:
-    print(f'\n❌ ERRORS ({len(errors)}):')
-    for e in errors:
-        print(f'  - {e}')
-    sys.exit(1)
-else:
-    print(f'\n✅ All {len(files)} sessions are well-formed')
-    print(f'   {len(parents)} parent + {len(children)} child sessions')
-    print(f'   {fork_count} fork-linked session(s)')
-"
+    print("\n".join(f"- {error}" for error in errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
 ```
 
-## Step 5: Report
+## Step 6: Report
 
-Print a final summary:
-
-```
-╭─────────────────────────────────────────────╮
-│ Integration Test Results                    │
-├─────────────────────────────────────────────┤
-│ Unit tests:        114/114 ✅               │
-│ Mux surface:       8/8  ✅                  │
-│ Subagent lifecycle: 7/7  ✅                 │
-│ Session validation: X sessions verified ✅  │
-│ Fork linkage:      verified ✅              │
-╰─────────────────────────────────────────────╯
-```
-
-If any step failed, summarize what broke and suggest next steps.
+Report exact commands, pass/fail/skipped counts from Node output, tested backend(s), Herdr version/protocol when applicable, session-validation totals, and any unavailable backend not exercised. Never claim a skipped or unavailable runtime passed.

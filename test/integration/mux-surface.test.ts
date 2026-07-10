@@ -10,7 +10,7 @@
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
@@ -24,7 +24,13 @@ import {
   focusSurface,
   getFocusedSurface,
   getSurfacePane,
+  supportsAbsoluteSurfaceFocus,
   waitForFocusedSurface,
+  createHerdrTab,
+  focusHerdrTab,
+  closeHerdrTab,
+  getHerdrSnapshot,
+  getHerdrPaneInfo,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -37,15 +43,15 @@ import {
   trackTempFile,
   waitForFile,
   waitForScreen,
+  SHELL_READY_DELAY_MS,
   type TestEnv,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
-const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside Herdr, cmux, tmux, zellij, or WezTerm to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -63,19 +69,33 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+    afterEach(() => {
+      for (const surface of [...env.surfaces]) {
+        try {
+          closeSurface(surface);
+        } catch {}
+        untrackSurface(env, surface);
+      }
+    });
+
+    it("keeps focus on the active surface while creating and targeting subagent surfaces", async (t) => {
+      if (!supportsAbsoluteSurfaceFocus(backend)) {
+        t.skip(`${backend} has no absolute pane-focus helper; backend-specific placement tests cover it`);
+        return;
+      }
+
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       focusSurface(backend, anchor);
       await waitForFocusedSurface(backend, anchor, 10_000);
 
       const childA = createTrackedSurface(env, "focus-child-a");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+      await sleep(SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
       const childB = createTrackedSurface(env, "focus-child-b");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+      await sleep(SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
       if (backend === "cmux") {
@@ -98,9 +118,80 @@ for (const backend of backends) {
       assert.equal(getFocusedSurface(backend), anchor);
     });
 
+    if (backend === "herdr") {
+      it("uses the captured caller pane even when global focus switches tabs", async () => {
+        const callerPaneId = process.env.HERDR_PANE_ID;
+        const callerTabId = process.env.HERDR_TAB_ID;
+        const callerWorkspaceId = process.env.HERDR_WORKSPACE_ID;
+        assert.ok(callerPaneId, "HERDR_PANE_ID must identify the caller pane");
+        assert.ok(callerTabId, "HERDR_TAB_ID must identify the caller tab");
+        assert.ok(callerWorkspaceId, "HERDR_WORKSPACE_ID must identify the caller workspace");
+
+        const originalFocus = getHerdrSnapshot();
+        let disposableTabId: string | null = null;
+        let child: string | null = null;
+
+        try {
+          const disposable = createHerdrTab({
+            workspaceId: callerWorkspaceId,
+            cwd: env.dir,
+            label: `focus-race-${uniqueId()}`,
+          });
+          disposableTabId = disposable.tabId;
+          focusHerdrTab(disposable.tabId);
+          await sleep(250);
+
+          const focusedBeforeCreate = getHerdrSnapshot();
+          assert.equal(focusedBeforeCreate.focused_tab_id, disposable.tabId);
+          assert.equal(focusedBeforeCreate.focused_pane_id, disposable.rootPaneId);
+
+          child = createTrackedSurface(env, "herdr-focus-race-child");
+          await sleep(SHELL_READY_DELAY_MS);
+          const childInfo = getHerdrPaneInfo(child);
+          assert.ok(childInfo, `Expected Herdr pane info for ${child}`);
+          assert.equal(childInfo.workspace_id, callerWorkspaceId);
+          assert.equal(childInfo.tab_id, callerTabId);
+          assert.equal(childInfo.focused, false);
+
+          const focusedAfterCreate = getHerdrSnapshot();
+          assert.equal(focusedAfterCreate.focused_tab_id, disposable.tabId);
+          assert.equal(focusedAfterCreate.focused_pane_id, disposable.rootPaneId);
+
+          const marker = uniqueId();
+          sendCommand(child, `echo "HERDR_FOCUS_${marker}"`);
+          await waitForScreen(child, new RegExp(`HERDR_FOCUS_${marker}`), 20_000, 50);
+        } finally {
+          if (originalFocus.focused_tab_id) {
+            try {
+              focusHerdrTab(originalFocus.focused_tab_id);
+            } catch {}
+          }
+          if (child) {
+            try {
+              closeSurface(child);
+            } catch {}
+            untrackSurface(env, child);
+          }
+          if (disposableTabId) {
+            try {
+              closeHerdrTab(disposableTabId);
+            } catch {}
+          }
+        }
+      });
+
+      it("treats closing an already closed Herdr pane as success", () => {
+        const surface = createTrackedSurface(env, "herdr-double-close");
+        closeSurface(surface);
+        closeSurface(surface);
+        untrackSurface(env, surface);
+        assert.equal(getHerdrPaneInfo(surface), null);
+      });
+    }
+
     it("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "MARKER_${marker}"`);
@@ -118,7 +209,7 @@ for (const backend of backends) {
 
     it("preserves shell special characters in echo output", async () => {
       const surface = createTrackedSurface(env, "escape-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
@@ -139,16 +230,14 @@ for (const backend of backends) {
 
     it("sends a long command via script file without truncation", async () => {
       const surface = createTrackedSurface(env, "long-cmd-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const longValue = "X".repeat(500);
       const command = `echo "LONG_${marker}_${longValue}_END"`;
 
       sendLongCommand(surface, command);
-      await sleep(2000);
-
-      const screen = readScreen(surface, 50);
+      const screen = await waitForScreen(surface, new RegExp(`LONG_${marker}.*_END`, "s"), 20_000, 100);
       assert.ok(
         screen.includes(`LONG_${marker}`),
         `Expected long command output. Got:\n${screen.slice(0, 300)}...`,
@@ -161,7 +250,7 @@ for (const backend of backends) {
 
     it("reads screen asynchronously", async () => {
       const surface = createTrackedSurface(env, "async-read-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "ASYNC_${marker}"`);
@@ -177,7 +266,8 @@ for (const backend of backends) {
     it("manages multiple surfaces concurrently", async () => {
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
-      await sleep(1500);
+      assert.notEqual(s1, s2, "Concurrent surface creation must return unique stable IDs");
+      await sleep(SHELL_READY_DELAY_MS);
 
       const m1 = uniqueId();
       const m2 = uniqueId();
@@ -194,7 +284,7 @@ for (const backend of backends) {
 
     it("writes output to a file and verifies via surface", async () => {
       const surface = createTrackedSurface(env, "file-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const filePath = `/tmp/pi-mux-test-${marker}.txt`;
@@ -213,7 +303,7 @@ for (const backend of backends) {
 
     it("delivers Escape as byte 27 to the target surface", async () => {
       const surface = createTrackedSurface(env, "escape-byte-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const byteFile = `/tmp/pi-mux-escape-${marker}.txt`;

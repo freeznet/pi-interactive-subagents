@@ -20,7 +20,12 @@ import {
 import {
   shellEscape,
   isCmuxAvailable,
+  isHerdrAvailable,
+  isCompatibleHerdrStatus,
+  isHerdrRuntimeAvailableWith,
   isWezTermAvailable,
+  parseMuxPreference,
+  selectMuxBackend,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
@@ -31,6 +36,14 @@ import {
   selectZellijPlacement,
   selectZellijStackPlacement,
 } from "../pi-extension/subagents/cmux.ts";
+import {
+  __herdrTest__,
+  buildHerdrReadArgs,
+  buildHerdrSplitArgs,
+  herdrErrorCode,
+  normalizeHerdrScreen,
+  parseHerdrPaneId,
+} from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -53,6 +66,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  buildAgentEndExitData,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -1292,6 +1306,23 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError([]), null);
     });
   });
+
+  describe("buildAgentEndExitData", () => {
+    it("writes a done sidecar for normal auto-exit completion", () => {
+      assert.deepEqual(buildAgentEndExitData(null), { type: "done" });
+    });
+
+    it("preserves provider errors in the auto-exit sidecar", () => {
+      assert.deepEqual(
+        buildAgentEndExitData({ errorMessage: "provider overloaded", stopReason: "error" }),
+        {
+          type: "error",
+          errorMessage: "provider overloaded",
+          stopReason: "error",
+        },
+      );
+    });
+  });
 });
 
 describe("cmux.ts interpretExitSidecar", () => {
@@ -1890,6 +1921,40 @@ describe("subagent interruption", () => {
   });
 });
 
+describe("owned surface launch cleanup", () => {
+  it("closes an owned surface exactly once when command delivery fails", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closed: string[] = [];
+    const lease = testApi.createSurfaceLaunchLease("Worker", undefined, {
+      create: () => "w9:p-test",
+      close: (surface: string) => closed.push(surface),
+    });
+
+    lease.cleanupOnFailure();
+    lease.cleanupOnFailure();
+
+    assert.deepEqual(closed, ["w9:p-test"]);
+  });
+
+  it("does not close a successfully launched or externally owned surface", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closed: string[] = [];
+    const operations = {
+      create: () => "w9:p-owned",
+      close: (surface: string) => closed.push(surface),
+    };
+
+    const launched = testApi.createSurfaceLaunchLease("Worker", undefined, operations);
+    launched.markLaunched();
+    launched.cleanupOnFailure();
+
+    const external = testApi.createSurfaceLaunchLease("Worker", "w9:p-external", operations);
+    external.cleanupOnFailure();
+
+    assert.deepEqual(closed, []);
+  });
+});
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {
@@ -2082,6 +2147,161 @@ describe("subagents widget rendering", () => {
         );
       }
     }
+  });
+});
+
+describe("herdr.ts", () => {
+  it("requires a reachable compatible Herdr server, not only a socket node", () => {
+    const env = {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "w9:p1",
+      HERDR_SOCKET_PATH: "/tmp/herdr.sock",
+    };
+    const base = {
+      hasCommand: () => true,
+      isSocket: () => true,
+      status: () => "server:\n  status: running\n  compatible: yes\n",
+    };
+
+    assert.equal(isCompatibleHerdrStatus(base.status()), true);
+    assert.equal(isHerdrRuntimeAvailableWith(env, base), true);
+    assert.equal(
+      isHerdrRuntimeAvailableWith(env, {
+        ...base,
+        status: () => { throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }); },
+      }),
+      false,
+    );
+    assert.equal(
+      isHerdrRuntimeAvailableWith(env, {
+        ...base,
+        status: () => "server:\n  status: stopped\n  compatible: no\n",
+      }),
+      false,
+    );
+  });
+
+  it("parses the stable pane ID from split JSON", () => {
+    assert.equal(
+      parseHerdrPaneId('{"result":{"pane":{"pane_id":"w9:p5"}}}'),
+      "w9:p5",
+    );
+  });
+
+  it("rejects missing, empty, and malformed split pane IDs", () => {
+    assert.throws(() => parseHerdrPaneId("not json"), /Herdr pane split.*invalid JSON/i);
+    assert.throws(
+      () => parseHerdrPaneId('{"result":{"pane":{}}}'),
+      /Herdr pane split.*result\.pane\.pane_id/i,
+    );
+    assert.throws(
+      () => parseHerdrPaneId('{"result":{"pane":{"pane_id":" "}}}'),
+      /Herdr pane split.*result\.pane\.pane_id/i,
+    );
+  });
+
+  it("builds an explicit-parent no-focus split command", () => {
+    assert.deepEqual(
+      buildHerdrSplitArgs({
+        parentPaneId: "w9:p3",
+        direction: "right",
+        cwd: "/repo",
+      }),
+      [
+        "pane",
+        "split",
+        "w9:p3",
+        "--direction",
+        "right",
+        "--cwd",
+        "/repo",
+        "--no-focus",
+      ],
+    );
+  });
+
+  it("rejects left/up splits instead of emulating them with focus-changing swaps", () => {
+    for (const direction of ["left", "up"] as const) {
+      assert.throws(
+        () => buildHerdrSplitArgs({ parentPaneId: "w9:p3", direction, cwd: "/repo" }),
+        /use right or down/i,
+      );
+    }
+  });
+
+  it("reads recent-unwrapped first, falls back to visible, and tails locally", async () => {
+    const syncCalls: string[][] = [];
+    const output = __herdrTest__.readHerdrScreenWithRunner(
+      "w9:p5",
+      2,
+      (args: string[]) => {
+        syncCalls.push(args);
+        return args.includes("recent-unwrapped") ? "" : "one\ntwo\nthree";
+      },
+    );
+
+    assert.equal(output, "two\nthree\ntwothree");
+    assert.deepEqual(syncCalls, [
+      buildHerdrReadArgs("w9:p5", 2, "recent-unwrapped"),
+      buildHerdrReadArgs("w9:p5", 2, "visible"),
+    ]);
+
+    const asyncOutput = await __herdrTest__.readHerdrScreenAsyncWithRunner(
+      "w9:p5",
+      2,
+      async (args: string[]) => (args.includes("recent-unwrapped") ? "" : "one\ntwo\nthree\n"),
+    );
+    assert.equal(asyncOutput, "two\nthree\n\ntwothree");
+    assert.equal(normalizeHerdrScreen("one\ntwo\nthree", 2), "two\nthree");
+  });
+
+  it("parses stderr before stdout and ignores only pane_not_found on close", () => {
+    const paneNotFound = {
+      stderr: Buffer.from('{"error":{"code":"pane_not_found","message":"gone"}}'),
+      stdout: '{"error":{"code":"permission_denied"}}',
+    };
+    assert.equal(herdrErrorCode(paneNotFound), "pane_not_found");
+    assert.equal(
+      herdrErrorCode({
+        stderr: "{}",
+        stdout: '{"error":{"code":"permission_denied"}}',
+      }),
+      "permission_denied",
+    );
+    assert.doesNotThrow(() =>
+      __herdrTest__.closeHerdrSurfaceWithRunner("w9:p5", () => {
+        throw paneNotFound;
+      }),
+    );
+
+    assert.throws(
+      () =>
+        __herdrTest__.closeHerdrSurfaceWithRunner("w9:p5", () => {
+          throw {
+            stderr: '{"error":{"code":"permission_denied","message":"denied"}}',
+          };
+        }),
+      /Herdr pane close failed for pane w9:p5: denied/,
+    );
+  });
+
+  it("selects Herdr first, preserves forced-unavailable semantics, and ignores invalid overrides", () => {
+    const availability = {
+      herdr: true,
+      tmux: true,
+      zellij: true,
+      cmux: true,
+      wezterm: true,
+    };
+    assert.equal(selectMuxBackend(availability), "herdr");
+    assert.equal(selectMuxBackend({ ...availability, herdr: false }, "herdr"), null);
+    assert.equal(selectMuxBackend(availability, "not-a-mux"), "herdr");
+    assert.equal(parseMuxPreference(" HERDR "), "herdr");
+    assert.equal(parseMuxPreference("not-a-mux"), null);
+  });
+
+  it("reports Herdr availability as a boolean", () => {
+    assert.equal(typeof isHerdrAvailable(), "boolean");
   });
 });
 

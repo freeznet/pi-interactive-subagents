@@ -892,6 +892,37 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function createSurfaceLaunchLease(
+  name: string,
+  providedSurface?: string,
+  operations: {
+    create: (surfaceName: string) => string;
+    close: (surface: string) => void;
+  } = { create: createSurface, close: closeSurface },
+) {
+  const owned = providedSurface === undefined;
+  const surface = providedSurface ?? operations.create(name);
+  let launched = false;
+  let cleaned = false;
+
+  return {
+    surface,
+    owned,
+    markLaunched() {
+      launched = true;
+    },
+    cleanupOnFailure() {
+      if (!owned || launched || cleaned) return;
+      cleaned = true;
+      try {
+        operations.close(surface);
+      } catch {
+        // Preserve the original launch failure.
+      }
+    },
+  };
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -911,6 +942,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  createSurfaceLaunchLease,
   runningSubagents,
   formatElapsed,
 };
@@ -966,15 +998,17 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  // Use pre-created surface (parallel mode) or create a new owned surface.
+  // Any failure before command delivery closes only surfaces created here.
+  const surfaceLease = createSurfaceLaunchLease(params.name, options?.surface);
+  const surface = surfaceLease.surface;
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  try {
+    if (surfaceLease.owned) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1056,6 +1090,7 @@ async function launchSubagent(
         `# Surface: ${surface}`,
       ].join("\n"),
     });
+    surfaceLease.markLaunched();
 
     const running: RunningSubagent = {
       id,
@@ -1195,6 +1230,7 @@ async function launchSubagent(
       `# Surface: ${surface}`,
     ].join("\n"),
   });
+  surfaceLease.markLaunched();
 
   const running: RunningSubagent = {
     id,
@@ -1215,6 +1251,10 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  } catch (error) {
+    surfaceLease.cleanupOnFailure();
+    throw error;
+  }
 }
 
 /**
@@ -1793,11 +1833,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const surfaceLease = createSurfaceLaunchLease(name);
+        const surface = surfaceLease.surface;
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        try {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+
+          // Build pi resume command
+          const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1861,6 +1904,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
+        surfaceLease.markLaunched();
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -1960,6 +2004,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        } catch (error) {
+          surfaceLease.cleanupOnFailure();
+          throw error;
+        }
       },
     });
 
