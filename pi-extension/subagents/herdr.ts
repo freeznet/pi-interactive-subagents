@@ -183,7 +183,7 @@ export function normalizeHerdrScreen(output: string, lines: number): string {
   return hasTrailingNewline ? `${tail}\n` : tail;
 }
 
-function normalizeVisibleFallback(output: string, lines: number): string {
+function normalizeSearchableScreen(output: string, lines: number): string {
   const normalized = normalizeHerdrScreen(output, lines);
   const unwrappedSearchCopy = normalized.replace(/\n/g, "");
   return unwrappedSearchCopy === normalized
@@ -197,21 +197,17 @@ function readHerdrScreenWithRunner(
   runner: HerdrSyncRunner,
 ): string {
   let output: string;
-  let usedVisibleFallback = false;
   try {
     output = runner(buildHerdrReadArgs(paneId, lines, "recent-unwrapped"));
     // Herdr may return only the prompt for a bounded recent read even though
     // useful output remains visible. Treat a one-line read as incomplete.
     if (output.trim().length === 0 || output.trim().split("\n").length === 1) {
       output = runner(buildHerdrReadArgs(paneId, lines, "visible"));
-      usedVisibleFallback = true;
     }
   } catch (error) {
     throw herdrOperationError("pane read", paneId, error);
   }
-  return usedVisibleFallback
-    ? normalizeVisibleFallback(output, lines)
-    : normalizeHerdrScreen(output, lines);
+  return normalizeSearchableScreen(output, lines);
 }
 
 async function readHerdrScreenAsyncWithRunner(
@@ -220,20 +216,16 @@ async function readHerdrScreenAsyncWithRunner(
   runner: HerdrAsyncRunner,
 ): Promise<string> {
   let output: string;
-  let usedVisibleFallback = false;
   try {
     output = await runner(buildHerdrReadArgs(paneId, lines, "recent-unwrapped"));
     // Keep async behavior identical to the synchronous watcher fallback.
     if (output.trim().length === 0 || output.trim().split("\n").length === 1) {
       output = await runner(buildHerdrReadArgs(paneId, lines, "visible"));
-      usedVisibleFallback = true;
     }
   } catch (error) {
     throw herdrOperationError("pane read", paneId, error);
   }
-  return usedVisibleFallback
-    ? normalizeVisibleFallback(output, lines)
-    : normalizeHerdrScreen(output, lines);
+  return normalizeSearchableScreen(output, lines);
 }
 
 export function readHerdrScreen(paneId: string, lines: number): string {

@@ -177,6 +177,11 @@ export function getHerdrPaneByLabel(label: string): string | null {
   return snapshot.panes?.find((pane) => pane.label === label)?.pane_id ?? null;
 }
 
+export function getHerdrPaneIds(): Set<string> {
+  const snapshot = getHerdrSnapshot();
+  return new Set([...(snapshot.panes ?? []), ...(snapshot.agents ?? [])].map((pane) => pane.pane_id));
+}
+
 export function createHerdrTab(input: {
   workspaceId: string;
   cwd: string;
@@ -515,6 +520,20 @@ export async function waitForHerdrPaneForSession(
     await sleep(500);
   }
   throw new Error(`Timeout (${timeout}ms) waiting for Herdr pane for session ${sessionPath}`);
+}
+
+export async function waitForNewHerdrPane(
+  existingPaneIds: ReadonlySet<string>,
+  timeout: number = PI_TIMEOUT,
+): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    for (const paneId of getHerdrPaneIds()) {
+      if (!existingPaneIds.has(paneId)) return paneId;
+    }
+    await sleep(200);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for a newly created Herdr pane`);
 }
 
 export async function waitForHerdrPaneByLabel(

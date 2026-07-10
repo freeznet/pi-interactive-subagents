@@ -36,7 +36,8 @@ import {
   readScreen,
   sendCommand,
   closeSurface,
-  waitForHerdrPaneForSession,
+  getHerdrPaneIds,
+  waitForNewHerdrPane,
   waitForHerdrPaneClosed,
   TEST_MODEL,
   PI_TIMEOUT,
@@ -366,6 +367,7 @@ for (const backend of backends) {
 
         const surface = createTrackedSurface(env, `resume-${id}`);
         await sleep(SHELL_READY_DELAY_MS);
+        const panesBeforeSeed = getHerdrPaneIds();
 
         const task = [
           `Call the subagent tool with these EXACT parameters:`,
@@ -383,14 +385,18 @@ for (const backend of backends) {
         ].join("\n");
 
         startPi(surface, env.dir, task);
+        const seedPanePromise = waitForNewHerdrPane(panesBeforeSeed, PI_TIMEOUT);
 
         const sessionPath = (await waitForFile(sessionPathFile, PI_TIMEOUT, /\.jsonl/)).trim();
         assert.ok(existsSync(sessionPath), `Seed session should exist: ${sessionPath}`);
-        const seedPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+        const seedPane = await seedPanePromise;
         await waitForFile(seedFile, PI_TIMEOUT, new RegExp(`SEED_${id}`));
         await waitForHerdrPaneClosed(seedPane, PI_TIMEOUT);
 
-        const resumedPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+        const resumedPane = await waitForNewHerdrPane(
+          new Set([...panesBeforeSeed, seedPane]),
+          PI_TIMEOUT,
+        );
         assert.notEqual(resumedPane, seedPane, "Resume must launch in a new stable pane");
 
         const resumed = await waitForFile(resumedFile, PI_TIMEOUT, new RegExp(`RESUMED_${id}`));
@@ -429,6 +435,7 @@ for (const backend of backends) {
 
         const surface = createTrackedSurface(env, `interrupt-${id}`);
         await sleep(SHELL_READY_DELAY_MS);
+        const panesBeforeChild = getHerdrPaneIds();
 
         const childName = `Interrupt-${id}`;
         const task = [
@@ -444,11 +451,12 @@ for (const backend of backends) {
         ].join("\n");
 
         startPi(surface, env.dir, task);
+        const childPanePromise = waitForNewHerdrPane(panesBeforeChild, PI_TIMEOUT);
 
         await waitForFile(startFile, PI_TIMEOUT, new RegExp(`START_${id}`));
         const sessionPath = (await waitForFile(sessionPathFile, PI_TIMEOUT, /\.jsonl/)).trim();
         assert.ok(existsSync(sessionPath), `Interrupted child session should exist: ${sessionPath}`);
-        const childPane = await waitForHerdrPaneForSession(sessionPath, PI_TIMEOUT);
+        const childPane = await childPanePromise;
 
         const interruptScreen = await waitForScreen(
           surface,
