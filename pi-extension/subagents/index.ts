@@ -81,7 +81,16 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  return ensureModuleAbortController().signal;
+}
+
+function ensureModuleAbortController(): AbortController {
+  const current = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  if (current && !current.signal.aborted) return current;
+
+  const replacement = new AbortController();
+  (globalThis as any)[POLL_ABORT_KEY] = replacement;
+  return replacement;
 }
 
 const SubagentParams = Type.Object({
@@ -943,6 +952,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   createSurfaceLaunchLease,
+  getModuleAbortSignal,
   runningSubagents,
   formatElapsed,
 };
@@ -1400,6 +1410,10 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    // /new, /resume, and /fork emit session_shutdown followed by session_start
+    // without guaranteeing a fresh module evaluation. Re-arm the module-level
+    // poll signal so watchers in the replacement session do not abort instantly.
+    ensureModuleAbortController();
     latestCtx = ctx;
   });
 

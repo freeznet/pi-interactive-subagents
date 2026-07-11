@@ -93,19 +93,25 @@ function withTempDir(run: (dir: string) => void) {
 }
 
 function createMockExtensionApi() {
+  const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
+    handlers,
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(name: string, handler: (event: any, ctx: any) => any) {
+        const registered = handlers.get(name) ?? [];
+        registered.push(handler);
+        handlers.set(name, registered);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1230,6 +1236,32 @@ describe("subagent discovery", () => {
     });
   });
 });
+
+describe("extension lifecycle", () => {
+  it("re-arms the watcher abort signal after a session replacement", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { api, handlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const sessionStart = handlers.get("session_start")?.[0];
+    const sessionShutdown = handlers.get("session_shutdown")?.[0];
+    assert.ok(sessionStart, "expected session_start handler");
+    assert.ok(sessionShutdown, "expected session_shutdown handler");
+
+    await sessionStart({ reason: "startup" }, { hasUI: false });
+    const initialSignal = testApi.getModuleAbortSignal();
+    assert.equal(initialSignal.aborted, false);
+
+    await sessionShutdown({ reason: "new" }, { hasUI: false });
+    assert.equal(initialSignal.aborted, true);
+
+    await sessionStart({ reason: "new" }, { hasUI: false });
+    const replacementSignal = testApi.getModuleAbortSignal();
+    assert.equal(replacementSignal.aborted, false);
+    assert.notEqual(replacementSignal, initialSignal);
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
