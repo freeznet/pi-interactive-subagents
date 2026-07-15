@@ -66,7 +66,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (Herdr, cmux, tmux). Herdr always splits from the caller's captured `HERDR_PANE_ID` with `--no-focus`, so global tab/workspace focus changes cannot redirect placement. Herdr v1 creates right/down splits only; normal subagent creation uses right. Launch commands target child surfaces by stable explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (Herdr, cmux, tmux). Herdr captures the caller's `HERDR_PANE_ID`, so global tab/workspace focus changes cannot redirect placement. The first child safely splits the caller (right preferred, down when width requires it). Later children split only the child subtree; when no safe split remains, they open in a new no-focus tab. This preserves minimum caller/child dimensions instead of repeatedly shrinking the main Pi pane. Tune the limits with `PI_SUBAGENT_HERDR_MIN_COLUMNS` (default `40`) and `PI_SUBAGENT_HERDR_MIN_ROWS` (default `10`). Launch commands target child surfaces by stable explicit ID, so focus and command delivery remain independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 

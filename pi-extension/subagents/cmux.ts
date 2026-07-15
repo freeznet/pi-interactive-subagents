@@ -6,9 +6,13 @@ import { basename, dirname, join } from "node:path";
 import {
   closeHerdrSurface,
   createHerdrSurface,
+  createHerdrTabSurface,
+  herdrErrorCode,
   readHerdrScreen,
   readHerdrScreenAsync,
+  readHerdrPaneLayout,
   renameHerdrPane,
+  selectHerdrSplitPlacement,
   sendHerdrCommand,
   sendHerdrEscape,
 } from "./herdr.ts";
@@ -307,6 +311,15 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
 /** Tracked subagent pane for cmux — reused across subagent launches. */
 let cmuxSubagentPane: string | null = null;
 
+const HERDR_SUBAGENT_PANES_KEY = "__piInteractiveSubagentsHerdrPanesByCaller";
+const herdrSubagentPanesByCaller: Map<string, Set<string>> =
+  ((globalThis as any)[HERDR_SUBAGENT_PANES_KEY] as Map<string, Set<string>> | undefined) ??
+  new Map<string, Set<string>>();
+(globalThis as any)[HERDR_SUBAGENT_PANES_KEY] = herdrSubagentPanesByCaller;
+
+const DEFAULT_HERDR_SUBAGENT_MIN_COLUMNS = 40;
+const DEFAULT_HERDR_SUBAGENT_MIN_ROWS = 10;
+
 // Mirrors Zellij 0.44.x tab minimums, used to predict which pane Zellij itself
 // will choose for a directionless split.
 const ZELLIJ_MIN_TERMINAL_WIDTH = 5;
@@ -553,6 +566,106 @@ function createZellijTab(name: string): string {
 function envPositiveInteger(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function herdrSubagentPanes(callerPaneId: string): Set<string> {
+  let panes = herdrSubagentPanesByCaller.get(callerPaneId);
+  if (!panes) {
+    panes = new Set<string>();
+    herdrSubagentPanesByCaller.set(callerPaneId, panes);
+  }
+  return panes;
+}
+
+function forgetHerdrSubagentPane(surface: string): void {
+  for (const [callerPaneId, panes] of herdrSubagentPanesByCaller) {
+    panes.delete(surface);
+    if (panes.size === 0) herdrSubagentPanesByCaller.delete(callerPaneId);
+  }
+}
+
+function createHerdrSubagentSurface(name: string, callerPaneId: string): string {
+  const minColumns = envPositiveInteger(
+    "PI_SUBAGENT_HERDR_MIN_COLUMNS",
+    DEFAULT_HERDR_SUBAGENT_MIN_COLUMNS,
+  );
+  const minRows = envPositiveInteger(
+    "PI_SUBAGENT_HERDR_MIN_ROWS",
+    DEFAULT_HERDR_SUBAGENT_MIN_ROWS,
+  );
+  const trackedPanes = herdrSubagentPanes(callerPaneId);
+  const seenTabs = new Set<string>();
+
+  // Once a child branch exists, grow only that branch. Never repeatedly split
+  // the caller pane: four right splits can reduce a 93-column Pi pane to 5
+  // columns, which makes pi-tui reject overflowing rendered lines and exit.
+  for (const trackedPaneId of [...trackedPanes]) {
+    let layout;
+    try {
+      layout = readHerdrPaneLayout(trackedPaneId);
+    } catch (error) {
+      if (herdrErrorCode(error) === "pane_not_found") {
+        trackedPanes.delete(trackedPaneId);
+        surfaceBackends.delete(trackedPaneId);
+        continue;
+      }
+      throw error;
+    }
+
+    if (seenTabs.has(layout.tabId)) continue;
+    seenTabs.add(layout.tabId);
+    const placement = selectHerdrSplitPlacement(
+      layout,
+      trackedPanes,
+      minColumns,
+      minRows,
+    );
+    if (!placement) continue;
+
+    const surface = createHerdrSurface({
+      name,
+      parentPaneId: placement.parentPaneId,
+      direction: placement.direction,
+      cwd: process.cwd(),
+    });
+    trackedPanes.add(surface);
+    return surface;
+  }
+
+  const callerLayout = readHerdrPaneLayout(callerPaneId);
+
+  // First child may split the caller, preferring a right split. The minimum
+  // dimensions guarantee the parent remains usable; a down split is selected
+  // when a right split would make either pane too narrow.
+  if (trackedPanes.size === 0) {
+    const placement = selectHerdrSplitPlacement(
+      callerLayout,
+      [callerPaneId],
+      minColumns,
+      minRows,
+      "right",
+    );
+    if (placement) {
+      const surface = createHerdrSurface({
+        name,
+        parentPaneId: placement.parentPaneId,
+        direction: placement.direction,
+        cwd: process.cwd(),
+      });
+      trackedPanes.add(surface);
+      return surface;
+    }
+  }
+
+  // Child subtree has no safe split (or caller is already too small). A new
+  // no-focus tab preserves every existing pane instead of violating minimums.
+  const surface = createHerdrTabSurface({
+    name,
+    workspaceId: callerLayout.workspaceId,
+    cwd: process.cwd(),
+  });
+  trackedPanes.add(surface);
+  return surface;
 }
 
 function sleepSync(milliseconds: number): void {
@@ -852,7 +965,9 @@ function createCmuxSplitSurface(
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For Herdr/tmux/wezterm: falls back to split behavior.
+ * For Herdr: the first child safely splits the caller; later children grow the
+ * child subtree or move to a new tab, so the caller never becomes unusably narrow.
+ * For tmux/wezterm: falls back to split behavior.
  *
  * Returns an identifier (`w9:p5` in Herdr, `surface:42` in cmux, `%12` in tmux,
  * `pane:7` in zellij, `42` in wezterm).
@@ -881,15 +996,7 @@ export function createSurface(name: string): string {
   if (backend === "herdr") {
     const parentPaneId = process.env.HERDR_PANE_ID;
     if (!parentPaneId?.trim()) throw new Error("HERDR_PANE_ID not set");
-    return bindSurface(
-      createHerdrSurface({
-        name,
-        parentPaneId,
-        direction: "right",
-        cwd: process.cwd(),
-      }),
-      backend,
-    );
+    return bindSurface(createHerdrSubagentSurface(name, parentPaneId), backend);
   }
 
   if (backend === "zellij") {
@@ -1372,6 +1479,7 @@ export function closeSurface(surface: string): void {
 
   if (backend === "herdr") {
     closeHerdrSurface(surface);
+    forgetHerdrSubagentPane(surface);
     surfaceBackends.delete(surface);
     return;
   }

@@ -38,11 +38,16 @@ import {
 } from "../pi-extension/subagents/cmux.ts";
 import {
   __herdrTest__,
+  buildHerdrTabCreateArgs,
   buildHerdrReadArgs,
   buildHerdrSplitArgs,
+  chooseHerdrSplitDirection,
   herdrErrorCode,
   normalizeHerdrScreen,
+  parseHerdrPaneLayout,
   parseHerdrPaneId,
+  parseHerdrTabSurface,
+  selectHerdrSplitPlacement,
 } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
@@ -2259,6 +2264,73 @@ describe("herdr.ts", () => {
         /use right or down/i,
       );
     }
+  });
+
+  it("parses pane layouts and selects only safe child-subtree splits", () => {
+    const layout = parseHerdrPaneLayout(JSON.stringify({
+      result: {
+        layout: {
+          workspace_id: "w9",
+          tab_id: "w9:t1",
+          panes: [
+            { pane_id: "w9:p1", rect: { x: 0, y: 0, width: 46, height: 34 } },
+            { pane_id: "w9:p2", rect: { x: 46, y: 0, width: 46, height: 17 } },
+            { pane_id: "w9:p3", rect: { x: 46, y: 17, width: 46, height: 17 } },
+          ],
+        },
+      },
+    }));
+
+    assert.deepEqual(layout, {
+      workspaceId: "w9",
+      tabId: "w9:t1",
+      panes: [
+        { paneId: "w9:p1", rect: { x: 0, y: 0, width: 46, height: 34 } },
+        { paneId: "w9:p2", rect: { x: 46, y: 0, width: 46, height: 17 } },
+        { paneId: "w9:p3", rect: { x: 46, y: 17, width: 46, height: 17 } },
+      ],
+    });
+    assert.deepEqual(
+      selectHerdrSplitPlacement(layout, ["w9:p1"], 40, 10, "right"),
+      { parentPaneId: "w9:p1", direction: "down" },
+    );
+    assert.equal(selectHerdrSplitPlacement(layout, ["w9:p2", "w9:p3"], 40, 10), null);
+  });
+
+  it("prefers right for the first safe split and falls back to down before refusing", () => {
+    assert.equal(
+      chooseHerdrSplitDirection({ x: 0, y: 0, width: 93, height: 34 }, 40, 10, "right"),
+      "right",
+    );
+    assert.equal(
+      chooseHerdrSplitDirection({ x: 0, y: 0, width: 46, height: 34 }, 40, 10, "right"),
+      "down",
+    );
+    assert.equal(
+      chooseHerdrSplitDirection({ x: 0, y: 0, width: 46, height: 17 }, 40, 10),
+      null,
+    );
+  });
+
+  it("builds and parses no-focus Herdr tab creation", () => {
+    assert.deepEqual(
+      buildHerdrTabCreateArgs({ workspaceId: "w9", cwd: "/repo", label: "worker" }),
+      [
+        "tab",
+        "create",
+        "--workspace",
+        "w9",
+        "--cwd",
+        "/repo",
+        "--label",
+        "worker",
+        "--no-focus",
+      ],
+    );
+    assert.deepEqual(
+      parseHerdrTabSurface('{"result":{"tab":{"tab_id":"w9:t2"},"root_pane":{"pane_id":"w9:p4"}}}'),
+      { tabId: "w9:t2", rootPaneId: "w9:p4" },
+    );
   });
 
   it("reads recent-unwrapped first, falls back to visible, and tails locally", async () => {

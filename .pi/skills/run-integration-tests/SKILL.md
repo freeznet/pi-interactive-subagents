@@ -86,7 +86,7 @@ Configure LLM-backed lifecycle tests when needed:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_TEST_MODEL` | `anthropic/claude-haiku-4-5` | Model for real Pi sessions |
+| `PI_TEST_MODEL` | `local/gpt-5.6-sol` | Model for real Pi sessions |
 | `PI_TEST_TIMEOUT` | `120000` | Per-test timeout in ms |
 
 ## Step 4: Herdr leak check

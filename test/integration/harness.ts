@@ -41,7 +41,11 @@ import {
   parseMuxPreference,
   type MuxBackend,
 } from "../../pi-extension/subagents/cmux.ts";
-import { herdrErrorCode } from "../../pi-extension/subagents/herdr.ts";
+import {
+  herdrErrorCode,
+  readHerdrPaneLayout,
+  type HerdrPaneLayout,
+} from "../../pi-extension/subagents/herdr.ts";
 
 // Re-export mux primitives for tests
 export {
@@ -80,7 +84,7 @@ const TEST_CONTROL_SOURCE = join(HARNESS_DIR, "test-control.ts");
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "local/gpt-5.6-sol";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -151,6 +155,10 @@ export function getHerdrPaneInfo(paneId: string): HerdrPaneInfo | null {
     if (herdrErrorCode(error) === "pane_not_found") return null;
     throw error;
   }
+}
+
+export function getHerdrPaneLayout(paneId: string): HerdrPaneLayout {
+  return readHerdrPaneLayout(paneId);
 }
 
 export function getHerdrPaneForSession(sessionPath: string): string | null {

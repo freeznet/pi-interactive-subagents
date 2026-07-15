@@ -31,6 +31,7 @@ import {
   closeHerdrTab,
   getHerdrSnapshot,
   getHerdrPaneInfo,
+  getHerdrPaneLayout,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -186,6 +187,84 @@ for (const backend of backends) {
         closeSurface(surface);
         untrackSurface(env, surface);
         assert.equal(getHerdrPaneInfo(surface), null);
+      });
+
+      it("keeps the caller pane size stable after the first of four child placements", async () => {
+        const callerPaneId = process.env.HERDR_PANE_ID;
+        assert.ok(callerPaneId, "HERDR_PANE_ID must identify the caller pane");
+
+        const children: string[] = [];
+        try {
+          children.push(createTrackedSurface(env, "herdr-placement-1"));
+          await sleep(250);
+          const afterFirst = getHerdrPaneLayout(callerPaneId);
+          const callerAfterFirst = afterFirst.panes.find((pane) => pane.paneId === callerPaneId);
+          assert.ok(callerAfterFirst, "caller pane must remain in its original tab after first child");
+
+          for (let i = 2; i <= 4; i++) {
+            children.push(createTrackedSurface(env, `herdr-placement-${i}`));
+          }
+          await sleep(250);
+
+          const afterAll = getHerdrPaneLayout(callerPaneId);
+          const callerAfterAll = afterAll.panes.find((pane) => pane.paneId === callerPaneId);
+          assert.ok(callerAfterAll, "caller pane must remain available after four children");
+          assert.deepEqual(callerAfterAll.rect, callerAfterFirst.rect);
+          assert.ok(callerAfterAll.rect.width >= 40, `caller width ${callerAfterAll.rect.width} < 40`);
+          assert.ok(callerAfterAll.rect.height >= 10, `caller height ${callerAfterAll.rect.height} < 10`);
+
+          for (const child of children) {
+            assert.ok(getHerdrPaneInfo(child), `expected child pane ${child} to remain available`);
+          }
+        } finally {
+          for (const child of children) {
+            try {
+              closeSurface(child);
+            } catch {}
+            untrackSurface(env, child);
+          }
+        }
+      });
+
+      it("opens a no-focus tab when configured minimums make every split unsafe", async () => {
+        const callerPaneId = process.env.HERDR_PANE_ID;
+        assert.ok(callerPaneId, "HERDR_PANE_ID must identify the caller pane");
+
+        const previousMinColumns = process.env.PI_SUBAGENT_HERDR_MIN_COLUMNS;
+        const before = getHerdrPaneLayout(callerPaneId);
+        const callerBefore = before.panes.find((pane) => pane.paneId === callerPaneId);
+        assert.ok(callerBefore, "caller pane must exist before fallback placement");
+        let child: string | null = null;
+
+        try {
+          process.env.PI_SUBAGENT_HERDR_MIN_COLUMNS = "9999";
+          child = createTrackedSurface(env, "herdr-tab-fallback");
+          const childInfo = getHerdrPaneInfo(child);
+          assert.ok(childInfo, "fallback child pane must exist");
+          assert.notEqual(childInfo.tab_id, before.tabId);
+          assert.equal(childInfo.focused, false);
+
+          const marker = uniqueId();
+          sendCommand(child, `echo "HERDR_TAB_FALLBACK_${marker}"`);
+          await waitForScreen(child, new RegExp(`HERDR_TAB_FALLBACK_${marker}`), 20_000, 50);
+
+          const after = getHerdrPaneLayout(callerPaneId);
+          const callerAfter = after.panes.find((pane) => pane.paneId === callerPaneId);
+          assert.ok(callerAfter, "caller pane must remain after fallback placement");
+          assert.deepEqual(callerAfter.rect, callerBefore.rect);
+        } finally {
+          if (previousMinColumns === undefined) {
+            delete process.env.PI_SUBAGENT_HERDR_MIN_COLUMNS;
+          } else {
+            process.env.PI_SUBAGENT_HERDR_MIN_COLUMNS = previousMinColumns;
+          }
+          if (child) {
+            try {
+              closeSurface(child);
+            } catch {}
+            untrackSurface(env, child);
+          }
+        }
       });
     }
 

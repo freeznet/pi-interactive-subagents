@@ -20,6 +20,27 @@ type HerdrReadSource = "recent-unwrapped" | "visible";
 type HerdrSyncRunner = (args: string[]) => string;
 type HerdrAsyncRunner = (args: string[]) => Promise<string>;
 
+export interface HerdrPaneRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HerdrPaneLayout {
+  workspaceId: string;
+  tabId: string;
+  panes: Array<{
+    paneId: string;
+    rect: HerdrPaneRect;
+  }>;
+}
+
+export interface HerdrSplitPlacement {
+  parentPaneId: string;
+  direction: HerdrSplitDirection;
+}
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -58,7 +79,12 @@ function errorOutput(error: unknown): { code?: string; message?: string } | null
 }
 
 export function herdrErrorCode(error: unknown): string | null {
-  return errorOutput(error)?.code ?? null;
+  const parsed = errorOutput(error)?.code;
+  if (parsed) return parsed;
+  if (error && typeof error === "object" && nonEmptyString((error as { code?: unknown }).code)) {
+    return (error as { code: string }).code;
+  }
+  return null;
 }
 
 function herdrOperationError(operation: string, target: string | null, error: unknown): Error {
@@ -69,7 +95,12 @@ function herdrOperationError(operation: string, target: string | null, error: un
       : null;
   const detail = parsed?.message ?? parsed?.code ?? systemCode ?? "unknown CLI error";
   const targetText = target ? ` for pane ${target}` : "";
-  return new Error(`Herdr ${operation} failed${targetText}: ${detail}`);
+  const wrapped = new Error(`Herdr ${operation} failed${targetText}: ${detail}`) as Error & {
+    code?: string;
+  };
+  const code = parsed?.code ?? systemCode;
+  if (code) wrapped.code = code;
+  return wrapped;
 }
 
 function runHerdrSync(args: string[], operation: string, target: string | null): string {
@@ -124,6 +155,177 @@ export function parseHerdrPaneId(output: string): string {
   return paneId;
 }
 
+export function buildHerdrTabCreateArgs(input: {
+  workspaceId: string;
+  cwd: string;
+  label: string;
+}): string[] {
+  if (!nonEmptyString(input.workspaceId)) {
+    throw new Error("Herdr tab creation requires an explicit workspace ID");
+  }
+  if (!nonEmptyString(input.cwd)) {
+    throw new Error("Herdr tab creation requires a working directory");
+  }
+  if (!nonEmptyString(input.label)) {
+    throw new Error("Herdr tab creation requires a label");
+  }
+
+  return [
+    "tab",
+    "create",
+    "--workspace",
+    input.workspaceId,
+    "--cwd",
+    input.cwd,
+    "--label",
+    input.label,
+    "--no-focus",
+  ];
+}
+
+export function parseHerdrTabSurface(output: string): { tabId: string; rootPaneId: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error("Unexpected Herdr tab create output: invalid JSON");
+  }
+
+  const result = (parsed as {
+    result?: { tab?: { tab_id?: unknown }; root_pane?: { pane_id?: unknown } };
+  })?.result;
+  const tabId = result?.tab?.tab_id;
+  const rootPaneId = result?.root_pane?.pane_id;
+  if (!nonEmptyString(tabId) || !nonEmptyString(rootPaneId)) {
+    throw new Error("Unexpected Herdr tab create output: missing tab/root pane identity");
+  }
+  return { tabId, rootPaneId };
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function parseHerdrPaneRect(value: unknown): HerdrPaneRect | null {
+  if (!value || typeof value !== "object") return null;
+  const rect = value as Record<string, unknown>;
+  if (
+    !finiteNumber(rect.x) ||
+    !finiteNumber(rect.y) ||
+    !finiteNumber(rect.width) ||
+    !finiteNumber(rect.height)
+  ) {
+    return null;
+  }
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+export function parseHerdrPaneLayout(output: string): HerdrPaneLayout {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error("Unexpected Herdr pane layout output: invalid JSON");
+  }
+
+  const layout = (parsed as { result?: { layout?: Record<string, unknown> } })?.result?.layout;
+  const workspaceId = layout?.workspace_id;
+  const tabId = layout?.tab_id;
+  const rawPanes = layout?.panes;
+  if (!nonEmptyString(workspaceId) || !nonEmptyString(tabId) || !Array.isArray(rawPanes)) {
+    throw new Error("Unexpected Herdr pane layout output: missing layout identity or panes");
+  }
+
+  const panes = rawPanes.map((value) => {
+    if (!value || typeof value !== "object") {
+      throw new Error("Unexpected Herdr pane layout output: malformed pane entry");
+    }
+    const pane = value as Record<string, unknown>;
+    const paneId = pane.pane_id;
+    const rect = parseHerdrPaneRect(pane.rect);
+    if (!nonEmptyString(paneId) || !rect) {
+      throw new Error("Unexpected Herdr pane layout output: malformed pane identity or rect");
+    }
+    return { paneId, rect };
+  });
+
+  return { workspaceId, tabId, panes };
+}
+
+function normalizedMinimum(value: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.trunc(value)) : 1;
+}
+
+function canSplitHerdrRect(
+  rect: HerdrPaneRect,
+  direction: HerdrSplitDirection,
+  minColumns: number,
+  minRows: number,
+): boolean {
+  const columns = Math.max(0, Math.trunc(rect.width));
+  const rows = Math.max(0, Math.trunc(rect.height));
+  if (direction === "right") {
+    return rows >= minRows && Math.floor(columns / 2) >= minColumns;
+  }
+  return columns >= minColumns && Math.floor(rows / 2) >= minRows;
+}
+
+export function chooseHerdrSplitDirection(
+  rect: HerdrPaneRect,
+  minColumns: number,
+  minRows: number,
+  preferredDirection?: HerdrSplitDirection,
+): HerdrSplitDirection | null {
+  const columns = normalizedMinimum(minColumns);
+  const rows = normalizedMinimum(minRows);
+  const canRight = canSplitHerdrRect(rect, "right", columns, rows);
+  const canDown = canSplitHerdrRect(rect, "down", columns, rows);
+
+  if (preferredDirection === "right" && canRight) return "right";
+  if (preferredDirection === "down" && canDown) return "down";
+  if (canRight && !canDown) return "right";
+  if (canDown && !canRight) return "down";
+  if (!canRight && !canDown) return null;
+
+  // Terminal cells are taller than wide. Keep resulting panes near a 4:1
+  // column/row ratio when both split directions satisfy the minimums.
+  const rightRatio = (rect.width / 2) / rect.height;
+  const downRatio = rect.width / (rect.height / 2);
+  return Math.abs(rightRatio - 4) <= Math.abs(downRatio - 4) ? "right" : "down";
+}
+
+export function selectHerdrSplitPlacement(
+  layout: HerdrPaneLayout,
+  candidatePaneIds: Iterable<string>,
+  minColumns: number,
+  minRows: number,
+  preferredDirection?: HerdrSplitDirection,
+): HerdrSplitPlacement | null {
+  const candidates = new Set(candidatePaneIds);
+  const panes = layout.panes
+    .filter((pane) => candidates.has(pane.paneId))
+    .sort((a, b) => {
+      const areaDiff = b.rect.width * b.rect.height - a.rect.width * a.rect.height;
+      return areaDiff !== 0 ? areaDiff : a.paneId.localeCompare(b.paneId);
+    });
+
+  for (const pane of panes) {
+    const direction = chooseHerdrSplitDirection(
+      pane.rect,
+      minColumns,
+      minRows,
+      preferredDirection,
+    );
+    if (direction) return { parentPaneId: pane.paneId, direction };
+  }
+  return null;
+}
+
 export function createHerdrSurface(input: {
   name: string;
   parentPaneId: string;
@@ -141,6 +343,34 @@ export function createHerdrSurface(input: {
   }
 
   return paneId;
+}
+
+export function createHerdrTabSurface(input: {
+  name: string;
+  workspaceId: string;
+  cwd: string;
+}): string {
+  const output = runHerdrSync(
+    buildHerdrTabCreateArgs({
+      workspaceId: input.workspaceId,
+      cwd: input.cwd,
+      label: input.name,
+    }),
+    "tab create",
+    null,
+  );
+  const { rootPaneId } = parseHerdrTabSurface(output);
+  try {
+    renameHerdrPane(rootPaneId, input.name);
+  } catch {
+    // Cosmetic only. Tab creation remains valid when pane rename fails.
+  }
+  return rootPaneId;
+}
+
+export function readHerdrPaneLayout(paneId: string): HerdrPaneLayout {
+  const output = runHerdrSync(["pane", "layout", "--pane", paneId], "pane layout", paneId);
+  return parseHerdrPaneLayout(output);
 }
 
 export function renameHerdrPane(paneId: string, title: string): void {
