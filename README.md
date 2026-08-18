@@ -182,11 +182,46 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | —              | Override agent's default model                                                                    |
+| `model`                | string  | —              | Override agent's default model. Restricted to the session's scoped-models (see [Model Scoping](#model-scoping)); omit to inherit the parent session's current model |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+### Model Scoping
+
+A bare model id like `glm-5.3` can exist in several providers' catalogs (`zai`, `zai-coding-cn`, `opencode-go`, …). When the child `pi` resolves `--model glm-5.3` it either errors out as ambiguous (several authenticated providers) or fuzzy-matches into an arbitrary provider — including one with **no configured credentials**, which leaves the subagent hung on its first API request.
+
+Subagent spawns therefore validate the model **before** any pane is created:
+
+1. **Scoped models** (from the `--models` CLI flag or the `enabledModels` setting — the same set `/scoped-models` shows) act as the allowlist when non-empty. Both the `model` tool parameter and agent frontmatter `model` must resolve to exactly one model in that set.
+2. Otherwise, **authenticated models** from the model registry act as the allowlist — providers without credentials can never be picked.
+3. When neither is available, the model string passes through unvalidated.
+
+Resolution rules mirror pi's own resolver: exact `provider/model` reference, then exact bare id, then fuzzy match on id/name. Ambiguous patterns are rejected with an error listing the candidates instead of silently picking one. A trailing `:thinking` suffix (e.g. `zai/glm-5.3:high`) is honored.
+
+When neither the tool parameter nor agent frontmatter specifies a model, the subagent **inherits the parent session's current model** (passed as a canonical `provider/model` reference) instead of letting the child fall back to its own default.
+
+Invalid choices return an immediate tool error listing the allowed models — no pane is spawned, so the orchestrator can retry with a valid model or omit `model` entirely.
+
+```typescript
+// OK: canonical reference
+subagent({ name: "Worker", task: "...", model: "zai/glm-5.3" });
+
+// OK: bare id, unique within scoped-models
+subagent({ name: "Worker", task: "...", model: "glm-5.3" });
+
+// Error (before any spawn): ambiguous across zai/glm-5.3 + zai-coding-cn/glm-5.3
+subagent({ name: "Worker", task: "...", model: "glm" });
+
+// Error (before any spawn): provider not in scoped-models / not authenticated
+subagent({ name: "Worker", task: "...", model: "opencode-go/glm-5.3" });
+
+// Recommended: omit model entirely and inherit the parent's current model
+subagent({ name: "Worker", task: "..." });
+```
+
+Claude Code-backed agents (`cli: claude` frontmatter) are exempt: the claude CLI resolves its own models.
 
 ---
 
@@ -305,7 +340,7 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
+| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`). Validated against the session's scoped-models when scoping is configured (see [Model Scoping](#model-scoping))                                                                                                                                        |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |

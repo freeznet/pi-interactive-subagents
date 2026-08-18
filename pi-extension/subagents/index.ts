@@ -35,6 +35,14 @@ import {
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
+  resolveSubagentModelScope,
+  normalizeModelRefs,
+  matchModelInScope,
+  splitThinkingSuffix,
+  type ModelScopeResult,
+  type SubagentModelResolution,
+} from "./model-scope.ts";
+import {
   type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
@@ -105,7 +113,14 @@ const SubagentParams = Type.Object({
   systemPrompt: Type.Optional(
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model override. Restricted to the session's scoped-models (enabledModels) — " +
+        "prefer the full 'provider/model' form (e.g. 'zai/glm-5.3'); a bare id must be unambiguous. " +
+        "Omit to inherit the parent session's current model. Invalid choices return an error listing allowed models.",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -955,6 +970,10 @@ export const __test__ = {
   getModuleAbortSignal,
   runningSubagents,
   formatElapsed,
+  resolveSubagentModelScope,
+  normalizeModelRefs,
+  matchModelInScope,
+  splitThinkingSuffix,
 };
 
 function startWidgetRefresh() {
@@ -970,21 +989,65 @@ function startWidgetRefresh() {
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
+ * Throws SubagentModelScopeError when the requested model is not in the
+ * session's model allowlist; callers should surface the error instead of
+ * spawning a doomed pane.
+ *
  * Call watchSubagent() on the returned object to observe completion.
  */
+interface LaunchContext {
+  sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+  cwd: string;
+  /** Parent session's active model — inherited when no model is requested. */
+  model?: { provider: string; id: string } | undefined;
+  /** Scoped models allowlist (ctx.scopedModels). */
+  scopedModels?: readonly unknown[] | undefined;
+  /** Model registry for authenticated-model fallback. */
+  modelRegistry?: { getAvailable(): unknown[] } | undefined;
+}
+
+export class SubagentModelScopeError extends Error {
+  readonly scopeError: string;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SubagentModelScopeError";
+    this.scopeError = message;
+  }
+}
+
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: LaunchContext,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+
+  // Resolve the model against the allowlist before creating any pane.
+  // Claude-backed agents resolve models through the claude CLI itself and are
+  // not validated here.
+  let modelResolution: SubagentModelResolution | undefined;
+  if (agentDefs?.cli !== "claude") {
+    const scope: ModelScopeResult = resolveSubagentModelScope({
+      requestedModel: params.model,
+      agentModel: agentDefs?.model,
+      agentThinking: agentDefs?.thinking,
+      scopedModels: ctx.scopedModels,
+      parentModel: ctx.model,
+      availableModels: ctx.modelRegistry ? ctx.modelRegistry.getAvailable() : undefined,
+    });
+    if (scope.error) {
+      throw new SubagentModelScopeError(scope.error);
+    }
+    modelResolution = scope.resolution;
+  }
+  const effectiveModel = modelResolution?.model ?? params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = modelResolution?.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1501,7 +1564,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx);
+        } catch (error) {
+          if (error instanceof SubagentModelScopeError) {
+            const hint = params.model
+              ? "Retry with an allowed model from the list above, or omit the `model` parameter to inherit the parent model."
+              : "The agent definition's `model` frontmatter is not usable — spawn without `agent`/with an explicit allowed `model`, or fix the agent's `model` frontmatter.";
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Sub-agent "${params.name}" was NOT launched — its model is not usable.\n\n` +
+                    `${error.scopeError}\n\n` +
+                    hint,
+                },
+              ],
+              details: { error: "model not in scope", ...(params.model ? { model: params.model } : {}) },
+            };
+          }
+          throw error;
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)

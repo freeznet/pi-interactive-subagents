@@ -74,6 +74,12 @@ import {
   buildAgentEndExitData,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import {
+  matchModelInScope,
+  normalizeModelRefs,
+  resolveSubagentModelScope,
+  splitThinkingSuffix,
+} from "../pi-extension/subagents/model-scope.ts";
 
 // --- Helpers ---
 
@@ -2697,6 +2703,170 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+});
+
+describe("model-scope.ts", () => {
+  const scope = [
+    { model: { provider: "zai", id: "glm-5.3", name: "GLM 5.3" }, thinkingLevel: "high" },
+    { model: { provider: "local", id: "gpt-5.6-sol", name: "GPT-5.6 Sol" } },
+    { model: { provider: "zai-coding-cn", id: "glm-5.3-coding", name: "GLM 5.3 Coding" } },
+  ];
+  const parentModel = { provider: "zai", id: "glm-5.3" };
+
+  describe("normalizeModelRefs", () => {
+    it("accepts both ScopedModel and bare Model shapes", () => {
+      const refs = normalizeModelRefs([
+        { model: { provider: "zai", id: "glm-5.3" }, thinkingLevel: "high" },
+        { provider: "local", id: "gpt-5.6-sol", name: "Sol" },
+        null,
+        42,
+        { model: { provider: "x" } },
+      ]);
+      assert.equal(refs.length, 2);
+      assert.equal(refs[0].thinkingLevel, "high");
+      assert.equal(refs[1].name, "Sol");
+    });
+  });
+
+  describe("splitThinkingSuffix", () => {
+    it("splits valid thinking levels", () => {
+      assert.deepEqual(splitThinkingSuffix("glm-5.3:high"), { base: "glm-5.3", thinking: "high" });
+      assert.deepEqual(splitThinkingSuffix("glm-5.3:xhigh"), { base: "glm-5.3", thinking: "xhigh" });
+    });
+
+    it("keeps invalid suffixes and colons inside ids", () => {
+      assert.deepEqual(splitThinkingSuffix("glm-5.3:banana"), { base: "glm-5.3:banana" });
+      assert.deepEqual(splitThinkingSuffix("openai/gpt-4o:extended"), { base: "openai/gpt-4o:extended" });
+      assert.deepEqual(splitThinkingSuffix("glm-5.3"), { base: "glm-5.3" });
+    });
+  });
+
+  describe("matchModelInScope", () => {
+    it("matches exact provider/model references case-insensitively", () => {
+      const { matches } = matchModelInScope("ZAI/GLM-5.3", normalizeModelRefs(scope));
+      assert.equal(matches.length, 1);
+      assert.equal(matches[0].provider, "zai");
+    });
+
+    it("matches unique bare ids", () => {
+      const { matches } = matchModelInScope("gpt-5.6-sol", normalizeModelRefs(scope));
+      assert.equal(matches.length, 1);
+      assert.equal(matches[0].provider, "local");
+    });
+
+    it("reports ambiguity for bare ids present in multiple providers", () => {
+      const refs = normalizeModelRefs([
+        ...scope,
+        { model: { provider: "opencode-go", id: "glm-5.3" } },
+      ]);
+      const { matches } = matchModelInScope("glm-5.3", refs);
+      assert.equal(matches.length, 2);
+    });
+
+    it("fuzzy-matches by id and display name", () => {
+      const refs = normalizeModelRefs(scope);
+      assert.equal(matchModelInScope("sol", refs).matches.length, 1);
+      assert.equal(matchModelInScope("GLM 5.3 Coding", refs).matches.length, 1);
+      // "glm" is fuzzy-ambiguous across zai and zai-coding-cn entries
+      assert.equal(matchModelInScope("glm", refs).matches.length, 2);
+    });
+  });
+
+  describe("resolveSubagentModelScope", () => {
+    it("resolves a full provider/model param to a canonical reference", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "zai/glm-5.3",
+        scopedModels: scope,
+        parentModel,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.resolution?.model, "zai/glm-5.3");
+      assert.equal(result.resolution?.source, "param");
+    });
+
+    it("keeps the param thinking suffix and prefers it over agent frontmatter", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "zai/glm-5.3:low",
+        agentThinking: "high",
+        scopedModels: scope,
+      });
+      assert.equal(result.resolution?.thinking, "low");
+    });
+
+    it("applies agent frontmatter thinking when the model comes from frontmatter", () => {
+      const result = resolveSubagentModelScope({
+        agentModel: "local/gpt-5.6-sol",
+        agentThinking: "xhigh",
+        scopedModels: scope,
+      });
+      assert.equal(result.resolution?.model, "local/gpt-5.6-sol");
+      assert.equal(result.resolution?.thinking, "xhigh");
+      assert.equal(result.resolution?.source, "agent");
+    });
+
+    it("inherits the parent model when nothing is requested", () => {
+      const result = resolveSubagentModelScope({ scopedModels: scope, parentModel });
+      assert.equal(result.resolution?.model, "zai/glm-5.3");
+      assert.equal(result.resolution?.source, "parent");
+    });
+
+    it("errors on ambiguous bare ids instead of picking a provider", () => {
+      const ambiguous = normalizeModelRefs([
+        ...scope,
+        { model: { provider: "zai-coding-cn", id: "glm-5.3" } },
+      ]);
+      const result = resolveSubagentModelScope({
+        requestedModel: "glm-5.3",
+        scopedModels: ambiguous,
+        parentModel,
+      });
+      assert.match(result.error!, /matches multiple/);
+      assert.match(result.error!, /zai\/glm-5\.3/);
+      assert.match(result.error!, /zai-coding-cn\/glm-5\.3/);
+      assert.equal(result.resolution, undefined);
+    });
+
+    it("errors when the requested model is outside the scoped allowlist", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "opencode-go/glm-5.3",
+        scopedModels: scope,
+        parentModel,
+      });
+      assert.match(result.error!, /not available for subagents/);
+      assert.match(result.error!, /parent model \(zai\/glm-5\.3\)/);
+      assert.equal(result.resolution, undefined);
+    });
+
+    it("rejects fuzzy patterns that match nothing", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "claude-opus",
+        scopedModels: scope,
+      });
+      assert.match(result.error!, /matches no model/);
+    });
+
+    it("falls back to authenticated models when no scoped models exist", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "glm-5.3",
+        availableModels: [{ provider: "zai", id: "glm-5.3" }],
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.resolution?.model, "zai/glm-5.3");
+    });
+
+    it("passes through unvalidated when no allowlist is available at all", () => {
+      const result = resolveSubagentModelScope({
+        requestedModel: "glm-5.3:anything",
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.resolution?.model, "glm-5.3:anything");
+    });
+
+    it("returns nothing when there is no request and no parent model", () => {
+      const result = resolveSubagentModelScope({ scopedModels: scope });
+      assert.deepEqual(result, {});
     });
   });
 });
