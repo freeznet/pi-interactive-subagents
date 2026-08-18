@@ -181,7 +181,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `autoExit`             | boolean | derived        | Force autonomous auto-exit: the session shuts down when its final turn completes, without relying on `subagent_done`. Defaults to the agent's `auto-exit` frontmatter; bare spawns default to `false` — pass `true` for one-shot bare spawns so a forgotten `subagent_done` cannot strand the pane. |
+| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of the effective `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model. Restricted to the session's scoped-models (see [Model Scoping](#model-scoping)); omit to inherit the parent session's current model |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |

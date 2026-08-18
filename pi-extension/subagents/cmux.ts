@@ -1559,9 +1559,16 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Grace period before a destroyed surface is reported as gone. Default 10s. */
+    surfaceGoneGraceMs?: number;
+    /** Test injection point for screen reads. Defaults to readScreenAsync. */
+    readScreen?: (surface: string, lines: number) => Promise<string>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const readScreenFn = options.readScreen ?? readScreenAsync;
+  const surfaceGoneGraceMs = options.surfaceGoneGraceMs ?? 10_000;
+  let surfaceGoneSince: number | null = null;
 
   for (;;) {
     if (signal.aborted) {
@@ -1591,7 +1598,8 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreenFn(surface, 5);
+      surfaceGoneSince = null;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1607,6 +1615,22 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      // A surface that stays unreadable past the grace period was closed
+      // manually or crashed without a completion signal. Report instead of
+      // looping forever — otherwise the parent watcher polls a dead pane
+      // indefinitely (observed with non-auto-exit spawns that never called
+      // subagent_done and whose pane the user later closed).
+      surfaceGoneSince ??= Date.now();
+      if (Date.now() - surfaceGoneSince >= surfaceGoneGraceMs) {
+        return {
+          reason: "error",
+          exitCode: 0,
+          errorMessage:
+            `Subagent pane "${surface}" disappeared before producing a completion signal. ` +
+            `It was likely closed manually or crashed without calling subagent_done. ` +
+            `Check the session file for partial progress.`,
+        };
       }
     }
 

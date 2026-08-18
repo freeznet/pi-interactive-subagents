@@ -35,6 +35,7 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  pollForExit,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   __herdrTest__,
@@ -1018,6 +1019,42 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolveEffectiveAutoExit: tool parameter overrides frontmatter; bare spawn defaults to false", () => {
+    // Bare spawn (no agent defs) — the default that stranded panes before.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), false);
+    // Tool parameter forces autonomous behavior on a bare spawn.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", autoExit: true }, null),
+      true,
+    );
+    // Tool parameter can also opt an auto-exit agent back into interactive mode.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", autoExit: false }, { autoExit: true }),
+      false,
+    );
+    // Frontmatter still applies when the tool parameter is omitted.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: true }),
+      true,
+    );
+  });
+
+  it("resolveEffectiveInteractive uses the effective (param-overridden) auto-exit", () => {
+    // Bare spawn with autoExit: true is autonomous — no stranded pane, stall pings enabled.
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T", autoExit: true }, null),
+      false,
+    );
+    // Explicit interactive still wins over autoExit: true.
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", autoExit: true, interactive: true },
+        null,
+      ),
+      true,
+    );
+  });
+
   it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
     for (const name of ["scout", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
@@ -1414,6 +1451,67 @@ describe("cmux.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+});
+
+describe("cmux.ts pollForExit surface-gone detection", () => {
+  it("reports an error after the grace period when the surface stays unreadable", async () => {
+    const readScreen = async () => {
+      throw new Error("pane_not_found");
+    };
+    const result = await pollForExit("w9:p-dead", new AbortController().signal, {
+      interval: 5,
+      surfaceGoneGraceMs: 30,
+      readScreen,
+    });
+
+    assert.equal(result.reason, "error");
+    assert.equal(result.exitCode, 0);
+    assert.match(result.errorMessage ?? "", /w9:p-dead.*disappeared/s);
+  });
+
+  it("resets the gone timer when the surface becomes readable again", async () => {
+    let failFirst = true;
+    const readScreen = async () => {
+      if (failFirst) {
+        failFirst = false;
+        throw new Error("transient read failure");
+      }
+      return "waiting for output…"; // readable, no sentinel, no .exit → keeps polling
+    };
+
+    const controller = new AbortController();
+    const rejectTimer = setTimeout(() => controller.abort(), 500);
+    await assert.rejects(
+      pollForExit("w9:p-flaky", controller.signal, {
+        interval: 5,
+        surfaceGoneGraceMs: 200,
+        readScreen,
+      }),
+      /Aborted/,
+    );
+    clearTimeout(rejectTimer);
+  });
+
+  it("prefers the .exit sidecar over the gone report when both are pending", async () => {
+    const readScreen = async () => {
+      throw new Error("pane_not_found");
+    };
+    const sessionFile = join(tmpdir(), `pi-poll-gone-sidecar-${Date.now()}.jsonl`);
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+
+    try {
+      const result = await pollForExit("w9:p-dead", new AbortController().signal, {
+        interval: 5,
+        surfaceGoneGraceMs: 0,
+        sessionFile,
+        readScreen,
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    } finally {
+      rmSync(sessionFile, { force: true });
+      rmSync(`${sessionFile}.exit`, { force: true });
+    }
   });
 });
 describe("commands", () => {
@@ -1956,7 +2054,7 @@ describe("subagent interruption", () => {
     );
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /agent error/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);

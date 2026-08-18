@@ -139,6 +139,15 @@ const SubagentParams = Type.Object({
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
     }),
   ),
+  autoExit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Force autonomous auto-exit for this spawn: the sub-agent session shuts down as soon as its final turn completes, " +
+        "so completion does NOT depend on the model remembering to call subagent_done. " +
+        "Recommended (true) for one-shot bare spawns without an agent definition — a missing subagent_done call would otherwise strand the pane forever. " +
+        "Defaults to the agent frontmatter's auto-exit; bare spawns default to false.",
+    }),
+  ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
@@ -356,19 +365,32 @@ function resolveLaunchBehavior(
 }
 
 /**
+ * Resolve the effective auto-exit behavior.
+ *   1. Explicit `autoExit` tool parameter wins.
+ *   2. Agent frontmatter `auto-exit`.
+ *   3. Default: false (interactive, must call subagent_done to finish).
+ */
+function resolveEffectiveAutoExit(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  return params.autoExit ?? agentDefs?.autoExit ?? false;
+}
+
+/**
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
  * Resolution order:
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
+ *   3. Default: the inverse of the effective auto-exit (frontmatter or tool
+ *      parameter). Auto-exit agents are autonomous (scout, worker, reviewer)
+ *      and the parent session should be woken on stall/recovery transitions.
+ *      Agents that don't auto-exit are driven by the user in their own pane
+ *      (planner, iterate/fork) and stall pings are noise.
  *
  * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
+ * typical for `/iterate` with `fork: true`), autoExit is undefined and the
  * subagent is treated as interactive — matching the intent of iterate.
  */
 function resolveEffectiveInteractive(
@@ -377,7 +399,7 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -478,7 +500,7 @@ function resolveResultPresentation(
     // change approach instead of silently treating the run as completed.
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `(agent error).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_resume.${sessionRef}`
@@ -954,6 +976,7 @@ export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
+  resolveEffectiveAutoExit,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
@@ -1048,6 +1071,7 @@ async function launchSubagent(
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = modelResolution?.thinking ?? agentDefs?.thinking;
+  const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1099,10 +1123,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
@@ -1242,7 +1266,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
@@ -1356,6 +1380,16 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/**
+ * Close a surface, ignoring failures. The pane may already be gone (crash,
+ * manual close, surface-gone poll path) — cleanup must never discard a result.
+ */
+function closeSurfaceSafe(surface: string): void {
+  try {
+    closeSurface(surface);
+  } catch {}
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1404,7 +1438,9 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      // The pane may already be gone (crash, manual close) — never let a
+      // failed cleanup discard the result we already have.
+      closeSurfaceSafe(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1429,7 +1465,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    closeSurfaceSafe(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -2187,7 +2223,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
             new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(agent error\\)\\.\\n\\n`,
             ),
             "",
           );
