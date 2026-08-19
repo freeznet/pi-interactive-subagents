@@ -976,9 +976,15 @@ describe("subagent discovery", () => {
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
       true,
     );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
+    // Bare one-shot spawn (no agent defs, no fork/interactive opt-in) is
+    // autonomous by default — auto-exit on final turn, stall pings enabled.
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      false,
+    );
+    // Bare /iterate fork spawn opts back into the interactive default.
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null),
       true,
     );
   });
@@ -1019,13 +1025,29 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("resolveEffectiveAutoExit: tool parameter overrides frontmatter; bare spawn defaults to false", () => {
-    // Bare spawn (no agent defs) — the default that stranded panes before.
-    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), false);
-    // Tool parameter forces autonomous behavior on a bare spawn.
+  it("resolveEffectiveAutoExit: tool parameter overrides frontmatter; bare one-shot spawns default to true", () => {
+    // Bare one-shot spawn (no agent defs) — auto-exits so a missing
+    // subagent_done call can never strand the pane.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), true);
+    // Bare fork spawn (/iterate) keeps the interactive (no auto-exit) default.
     assert.equal(
-      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", autoExit: true }, null),
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null),
+      false,
+    );
+    // Bare spawn with an explicit interactive opt-in stays interactive.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", interactive: true }, null),
+      false,
+    );
+    // Explicit interactive: false on a bare spawn is still one-shot.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", interactive: false }, null),
       true,
+    );
+    // Tool parameter forces interactive behavior on a bare spawn.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", autoExit: false }, null),
+      false,
     );
     // Tool parameter can also opt an auto-exit agent back into interactive mode.
     assert.equal(

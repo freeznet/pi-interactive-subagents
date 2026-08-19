@@ -144,14 +144,15 @@ const SubagentParams = Type.Object({
       description:
         "Force autonomous auto-exit for this spawn: the sub-agent session shuts down as soon as its final turn completes, " +
         "so completion does NOT depend on the model remembering to call subagent_done. " +
-        "Recommended (true) for one-shot bare spawns without an agent definition — a missing subagent_done call would otherwise strand the pane forever. " +
-        "Defaults to the agent frontmatter's auto-exit; bare spawns default to false.",
+        "Defaults to the agent frontmatter's auto-exit; bare one-shot spawns default to true " +
+        "(a missing subagent_done call would otherwise strand the pane forever). " +
+        "Bare spawns that opt into interactivity via `fork: true` or `interactive: true` default to false.",
     }),
   ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent and the spawn does not auto-exit. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of the effective auto-exit (bare one-shot spawns auto-exit and get stall pings; `fork: true` and agents that don't auto-exit are interactive and stay quiet).",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -368,13 +369,21 @@ function resolveLaunchBehavior(
  * Resolve the effective auto-exit behavior.
  *   1. Explicit `autoExit` tool parameter wins.
  *   2. Agent frontmatter `auto-exit`.
- *   3. Default: false (interactive, must call subagent_done to finish).
+ *   3. Agent defs without frontmatter `auto-exit`: false (interactive default,
+ *      e.g. planner).
+ *   4. Bare spawns: one-shot by default (true) — a model that ends its turn
+ *      without calling subagent_done must not strand the pane forever.
+ *      `fork: true` (iterate) and `interactive: true` opt back into the
+ *      interactive (false) default.
  */
 function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  return params.autoExit ?? agentDefs?.autoExit ?? false;
+  if (params.autoExit != null) return params.autoExit;
+  if (agentDefs) return agentDefs.autoExit ?? false;
+  if (params.fork || params.interactive === true) return false;
+  return true;
 }
 
 /**
@@ -389,9 +398,10 @@ function resolveEffectiveAutoExit(
  *      Agents that don't auto-exit are driven by the user in their own pane
  *      (planner, iterate/fork) and stall pings are noise.
  *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), autoExit is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
+ * When no agent defs exist at all (bare `subagent({ name, task })` call), the
+ * spawn is one-shot by default: effective auto-exit is true and the subagent
+ * is autonomous. Bare `fork: true` spawns (`/iterate`) opt back into the
+ * interactive default.
  */
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,

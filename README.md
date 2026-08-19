@@ -181,7 +181,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `autoExit`             | boolean | derived        | Force autonomous auto-exit: the session shuts down when its final turn completes, without relying on `subagent_done`. Defaults to the agent's `auto-exit` frontmatter; bare spawns default to `false` — pass `true` for one-shot bare spawns so a forgotten `subagent_done` cannot strand the pane. |
+| `autoExit`             | boolean | derived        | Force autonomous auto-exit: the session shuts down when its final turn completes, without relying on `subagent_done`. Defaults to the agent's `auto-exit` frontmatter. Bare one-shot spawns default to `true` (a forgotten `subagent_done` cannot strand the pane); bare spawns with `fork: true` or `interactive: true` default to `false`. |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of the effective `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model. Restricted to the session's scoped-models (see [Model Scoping](#model-scoping)); omit to inherit the parent session's current model |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -402,7 +402,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare one-shot spawns (no agent defs, no `fork`/`interactive` opt-in) auto-exit and are non-interactive; bare `fork: true` spawns (e.g. `/iterate`) are treated as interactive.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 
